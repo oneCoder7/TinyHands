@@ -1,20 +1,19 @@
-# tinyhands
+# Tinyhands
 
 **A complete agent runtime.**
 
 [简体中文](README.md) | English
 
-tinyhands is an embeddable, multi-conversation agent runtime. You run it as a
+Tinyhands is an embeddable, multi-conversation agent runtime. Run it as a
 service, create conversations and send messages over HTTP, and the agent
 autonomously reads/writes files, runs commands, executes code, and drives a
 browser inside an isolatable execution environment until the task is done —
-streaming every step back to you as an event stream.
+streaming every step back as an event stream.
 
-It isn't an end-user product; it's the foundation **downstream developers**
-build on. You write your own agent app (coding assistant, data analysis,
-automation…) on top of it, without having to build the whole stack yourself:
-LLM loop + tool calling + execution sandbox + session management + live
-streaming.
+It isn't an end-user product; it's the foundation for building agent apps
+(coding assistant, data analysis, automation…) — sparing the cost of assembling
+the whole stack from scratch: LLM loop + tool calling + execution sandbox +
+session management + live streaming.
 
 ## What it does
 
@@ -30,14 +29,14 @@ streaming.
 ```bash
 npm install
 
-# configure: copy the template and fill in your gateway URL, model, and token
+# configure: copy the template and fill in the gateway URL, model, and token
 cp .env.example .env
 $EDITOR .env
 
 npm run serve        # listens on :8787 by default
 ```
 
-The server starts with zero conversations — you create them on demand. A full
+The server starts with zero conversations — they are created on demand. A full
 round-trip:
 
 ```bash
@@ -63,7 +62,6 @@ the event stream.**
 `POST /conversations/create`, optionally with `conversationId` (auto-generated
 if omitted) and `tools` (the optional tools to enable). Each conversation gets
 its own workspace and execution environment.
-
 ### 2. Subscribe to the event stream
 
 Over WebSocket (`/ws/:id`) or SSE (`/sse/:id`) — the two are equivalent
@@ -75,17 +73,17 @@ then switches to live.
 Pass `?lastSeq=N` to replay only events after sequence `N` on reconnect — no
 gaps, no duplicates.
 
-You receive these events (each carries a monotonic `seq`):
+Subscribers receive these events (each carries a monotonic `seq`):
 
-| Event type          | Meaning                                         |
-| ------------------- | ----------------------------------------------- |
-| `user_message`      | a user message (yours is echoed to all viewers) |
-| `thinking_finished` | a finalized thinking block (extended thinking)  |
-| `agent_message`     | the agent's message + the tool calls it issued  |
-| `tool_result`       | the result of one tool call                     |
-| `finished`          | task complete (the agent called `finish`)       |
-| `interrupted`       | the run was interrupted by the user             |
-| `error`             | the run errored                                 |
+| Event type          | Meaning                                            |
+| ------------------- | -------------------------------------------------- |
+| `user_message`      | a user message (echoed to all viewers)             |
+| `thinking_finished` | a finalized thinking block (extended thinking)     |
+| `agent_message`     | the agent's message + the tool calls it issued     |
+| `tool_result`       | the result of one tool call                        |
+| `finished`          | task complete (the agent called `finish`)          |
+| `interrupted`       | the run was interrupted                            |
+| `error`             | the run errored                                    |
 
 Plus the transient `delta` (streaming tokens / thinking chunks) — broadcast
 only, never stored in history.
@@ -106,7 +104,7 @@ These are what make it easy to extend and embed:
 - **The event stream is the single source of truth.** Conversation state *is* an
   append-only event log; the context fed to the LLM is a pure projection of it.
   That makes a conversation inherently auditable, replayable, and persistable —
-  to store or time-travel-debug it, you consume just this one stream.
+  storing or time-travel-debugging it means consuming just this one stream.
 - **Runtime ≠ Sandbox; execution location is pluggable.** Tools only express
   intent ("run this command"); a `Runtime` decides where it runs. Host, Docker,
   and cloud sandbox share one set of tool code, switched with zero changes.
@@ -148,7 +146,6 @@ lifecycle) to plug in any sandbox backend. The built-in `Local` / `Docker` /
 `chat` method, speaking only neutral types) and add a `case` in
 `src/llm/factory.ts`. The agent and assembly layers don't change — they depend
 only on the interface.
-
 ## Roadmap
 
 - More built-in tools (web search, patch-based file editing, sub-task spawning)
