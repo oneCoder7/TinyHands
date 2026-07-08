@@ -4,35 +4,23 @@
 
 简体中文 | [English](README.en.md)
 
-用 TypeScript 写的多会话 agent 服务。单进程托管 N 个相互独立的会话——每个会话
-拥有各自的事件流、执行环境和工作目录——由外部通过 REST + WebSocket/SSE 驱动。
+tinyhands 是一个可嵌入的多会话 agent 运行时。你把它作为一个服务跑起来,
+通过 HTTP 创建会话、发消息,agent 就会在一个可隔离的执行环境里自主地
+读写文件、跑命令、执行代码、操作浏览器,直到完成任务——整个过程以事件流
+的形式实时推给你。
 
-## 设计
+它不是一个面向终端用户的产品,而是给**下游开发者**用的地基:你在它之上
+构建自己的 agent 应用(编程助手、数据分析、自动化任务……),无需自己
+从零搭建"LLM 循环 + 工具调用 + 执行沙箱 + 会话管理 + 实时推流"这一整套。
 
-- **事件流是唯一真相源。** 每个会话是一条只追加的事件日志;喂给 LLM 的
-  `Message[]` 是这条日志的纯投影,按需重新计算得出。
-- **Runtime ≠ Sandbox。** `Runtime` 决定工具*在哪里*执行:`LocalRuntime`
-  在宿主机上跑(零隔离),`DockerRuntime` 与 `OpenSandboxRuntime` 提供隔离。
-  工具只表达意图(执行命令、读写文件),执行位置交给 runtime 决定。
-- **中性 LLM 类型。** 只有 `anthropic-client.ts` 引入 Anthropic SDK,其余代码
-  一律使用与厂商无关的中性类型,因此更换模型 provider 只需改动这一个文件。
-- **上行走 REST,下行走 WS/SSE。** 命令(发消息 / 打断)统一经 REST;WebSocket
-  与 SSE 是对事件流的只读观察窗口。agent 的执行与「有没有人在看」完全解耦。
+## 能做什么
 
-## 架构
-
-```
-core/         配置 + 日志
-llm/          中性类型、LLMClient 接口、Anthropic 实现、工厂
-tools/        工具注册表 + 目录 + 各个工具
-runtime/      Runtime 接口 + Local/Docker/OpenSandbox 实现 + execd
-conversation/ 事件流 + 会话聚合根
-agent/        ReAct 循环
-server/       REST 路由、会话管理器、WS/SSE gateway、装配
-```
-
-依赖方向严格向下:`agent` 依赖 `conversation`、`tools`、`llm`、`runtime`——
-它们都不反向依赖 `agent`。
+- **多会话并发**——单进程托管任意多个相互隔离的会话,各有独立的工作目录和执行环境,互不干扰。
+- **自主工具循环**——内置 ReAct 循环:agent 自己决定调用哪个工具、看到结果后再决定下一步,直到调用 `finish` 收尾。
+- **可插拔执行环境**——同一套代码,一个环境变量即可在「本机直跑 / Docker 隔离 / OpenSandbox 云沙箱」之间切换。
+- **实时事件流**——每一步(思考、发言、工具调用、执行结果)都作为事件推送给订阅方,支持断线重连补发。
+- **协作式打断**——运行中随时可打断,agent 在检查点干净地停下,不留半截状态。
+- **流式输出**——支持 token 级流式,包括 extended thinking 的思考过程实时呈现。
 
 ## 快速开始
 
@@ -43,23 +31,111 @@ npm install
 cp .env.example .env
 $EDITOR .env
 
-npm run serve        # tsx src/main.ts
+npm run serve        # 默认监听 :8787
 ```
 
-服务默认监听 `:8787`,启动时零会话——由上游按需创建。
+服务启动时零会话,一切由你按需创建。下面是一次完整的交互:
 
 ```bash
-# 创建一个会话(可选启用额外工具)
+# 1) 创建会话,启用 shell 和代码执行工具
 curl -XPOST localhost:8787/conversations/create \
-  -d '{"tools":["run_bash","run_code"]}'
+  -d '{"conversationId":"demo","tools":["run_bash","run_code"]}'
 
-# 观察它的事件流(SSE)
-curl -N localhost:8787/sse/<conversationId>
+# 2) 订阅它的事件流(另开一个终端,保持连接)
+curl -N localhost:8787/sse/demo
 
-# 发一条消息
+# 3) 发一条消息,观察第 2 步的终端实时吐出 agent 的思考、工具调用与结果
 curl -XPOST localhost:8787/conversations/send \
-  -d '{"conversationId":"<id>","text":"列出工作目录里的文件"}'
+  -d '{"conversationId":"demo","text":"统计当前目录有多少个文件,写进 count.txt"}'
 ```
+
+## 集成方式
+
+典型的接入模式是:**上行发命令走 REST,下行看结果订阅事件流**。
+
+### 1. 创建会话
+
+`POST /conversations/create`,可选传 `conversationId`(不传则自动生成)和
+`tools`(要启用的可选工具)。每个会话对应一个独立的工作目录和执行环境。
+
+### 2. 订阅事件流
+
+用 WebSocket(`/ws/:id`)或 SSE(`/sse/:id`)订阅。两者是对等的只读观察窗口
+——agent 是否在运行,与有没有人在看**完全无关**;没有订阅者时后台照跑,
+新订阅者接入时会先补发历史事件,再转入实时。
+
+带 `?lastSeq=N` 参数即可在重连时只补发序号 `N` 之后的事件,不丢不重。
+
+你会收到这些事件(每条带单调递增的 `seq`):
+
+| 事件类型            | 含义                                        |
+| ------------------- | ------------------------------------------- |
+| `user_message`      | 用户消息(你发的会回显给所有订阅者)        |
+| `thinking_finished` | 一段思考定稿(extended thinking)           |
+| `agent_message`     | agent 的发言 + 它发起的工具调用             |
+| `tool_result`       | 某次工具调用的执行结果                      |
+| `finished`          | 任务完成(agent 调用了 `finish`)          |
+| `interrupted`       | 本轮 run 被用户打断                         |
+| `error`             | 运行出错                                    |
+
+外加瞬态的 `delta`(流式 token / 思考增量),只广播、不入历史。
+
+### 3. 发消息 / 打断
+
+`POST /conversations/send` 发消息触发一轮 run;`POST /conversations/interrupt`
+协作式打断进行中的 run。接口都是即时受理确认,真正的进展从事件流里看。
+
+完整接口见 [HTTP API](#http-api)。
+
+## 设计亮点
+
+这些设计决定了它好扩展、好嵌入:
+
+- **事件流是唯一真相源。** 会话状态就是一条只追加的事件日志;喂给 LLM 的
+  上下文是这条日志的纯投影。这意味着会话天然可审计、可回放、可持久化——
+  你要落库或做时间旅行调试,只需消费这一条流。
+- **Runtime ≠ Sandbox,执行位置可插拔。** 工具只表达意图(「跑这条命令」),
+  在哪跑由 `Runtime` 决定。本机、Docker、云沙箱共用一套工具代码,切换零改动。
+- **对厂商中性。** 整个内核只认一组中性 LLM 类型,只有一个文件真正 import
+  Anthropic SDK。换模型、换 provider 不会渗透到业务代码。
+- **传输与执行解耦。** WS/SSE 只是观察窗口,插拔订阅者不影响 agent 运行,
+  也让「加一种下行通道」变得廉价。
+
+## 扩展
+
+三个最常见的扩展点,都遵循开闭原则——加新东西,不改老代码:
+
+**加一个工具。** 实现 `Tool` 接口(`name` / `description` / Zod `schema` /
+`execute`),在 `src/tools/catalog.ts` 的目录里登记一行即可。工具通过
+`ctx.runtime` 执行,因此天然跨所有执行环境可用。
+
+```ts
+export const myTool: Tool<MyArgs> = {
+  name: "my_tool",
+  description: "给 LLM 看的说明,影响它何时选择这个工具",
+  schema: MyArgs,                       // zod/v4
+  async execute(args, ctx) {
+    const r = await ctx.runtime.exec(`...`);
+    return { content: r.stdout, isError: r.exitCode !== 0 };
+  },
+};
+```
+
+**换一种执行环境。** 实现 `Runtime` 接口(`exec` / `readFile` / `writeFile` /
+`runCode` / `runBrowser` + `create`/`kill` 生命周期),即可接入任意沙箱后端。
+内置 `Local` / `Docker` / `OpenSandbox` 三种可直接参考。
+
+**接一个新的 LLM provider。** 实现 `LLMClient` 接口(核心就一个 `chat` 方法,
+只用中性类型收发),在 `src/llm/factory.ts` 加一个 `case`。Agent 与装配层
+零改动,因为它们只依赖接口。
+
+## 未来方向
+
+- 更多内置工具(网络搜索、文件编辑补丁、子任务派生)
+- 会话持久化:把事件流落库,实现进程重启后恢复
+- `redacted_thinking` 块的完整处理(当前为已知缺口)
+- 更多 provider 实现(原生 OpenAI 协议等)
+- 更细粒度的资源配额(每会话的执行超时、预算上限)
 
 ## HTTP API
 
@@ -76,19 +152,17 @@ curl -XPOST localhost:8787/conversations/send \
 | WS     | `/ws/:conversationId`       | 下行事件流                |
 | SSE    | `/sse/:conversationId`      | 下行事件流                |
 
-两个下行通道都接受 `?lastSeq=N`,用于重连时补发序号 `N` 之后的历史事件。
-
 ## 配置
 
-所有配置在启动时从环境变量读取一次。
+所有配置在启动时从环境变量读取一次(见 `.env.example`)。
 
 | 变量                    | 默认值                               | 说明                                     |
 | ----------------------- | ------------------------------------ | ---------------------------------------- |
 | `ANTHROPIC_AUTH_TOKEN`  | —                                    | 必填(或用 `LLM_API_KEY`)               |
-| `PORT`                  | `8787`                               |                                          |
-| `WORKSPACE_ROOT`        | `./workspaces`                       | 每会话在其下有专属子目录                 |
 | `LLM_BASE_URL`          | —                                    | 必填 —— Anthropic 风格网关地址           |
 | `LLM_MODEL`             | —                                    | 必填 —— 模型名                           |
+| `PORT`                  | `8787`                               |                                          |
+| `WORKSPACE_ROOT`        | `./workspaces`                       | 每会话在其下有专属子目录                 |
 | `LLM_MAX_TOKENS`        | `8192`                               |                                          |
 | `LLM_THINKING_BUDGET`   | `2048`                               | `0` 表示关闭 extended thinking           |
 | `MAX_STEP`              | `10`                                 | agent 循环上限                           |
@@ -97,11 +171,12 @@ curl -XPOST localhost:8787/conversations/send \
 | `OPENSANDBOX_SERVER_URL`| `http://localhost:8080`              | 当 `RUNTIME=opensandbox` 时              |
 | `OPENSANDBOX_IMAGE`     | `opensandbox/code-interpreter:v1.1.0`| code-interpreter 镜像(内置 Jupyter)    |
 
-## 工具
+## 内置工具
 
-始终注册:`read_file`、`write_file`、`finish`。可选(创建会话时经 `tools` 字段
-开启):`run_bash`、`run_code`、`browser`。`run_code`(带富输出的 Jupyter kernel)
-与 `browser`(Playwright)需要能提供它们的 runtime —— Docker 或 OpenSandbox。
+始终可用:`read_file`、`write_file`、`finish`。可选(创建会话时经 `tools`
+字段开启):`run_bash`、`run_code`、`browser`。其中 `run_code`(带富输出的
+Jupyter kernel)与 `browser`(Playwright)需要能提供它们的 runtime——
+Docker 或 OpenSandbox。
 
 ## 开发
 
