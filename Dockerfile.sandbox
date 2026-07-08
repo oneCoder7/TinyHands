@@ -1,0 +1,25 @@
+# tinyhands sandbox 容器镜像
+#
+# 基础镜像:node:22-slim(~200MB,含 bash/coreutils,满足 execd 执行需求)。
+# 容器内只跑 execd server(纯 JS,零 npm 依赖),不安装项目 node_modules。
+#
+# 构建:docker build --platform linux/amd64 -f Dockerfile.sandbox -t tinyhands-sandbox:latest .
+# 运行(独立测试):docker run --rm -p 44772:44772 tinyhands-sandbox:latest
+#
+# 生产中由 DockerRuntime 自动创建/管理容器,无需手动 docker run。
+
+FROM node:22-slim
+
+LABEL tinyhands.component="sandbox"
+
+# workspace 目录:宿主 bind mount 的挂载点,也是 execd 的 cwd
+RUN mkdir -p /workspace
+
+# 复制 execd server(单文件,无依赖)
+COPY src/runtime/execd/server.js /opt/execd/server.js
+
+EXPOSE 44772
+
+WORKDIR /workspace
+
+CMD ["node", "/opt/execd/server.js"]

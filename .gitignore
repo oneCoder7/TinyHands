@@ -1,0 +1,24 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data
+workspaces/
+*.log
+
+# Tooling caches
+.playwright-mcp/
+.claude/
+
+# Internal design docs (not published)
+docs/
+
+# OS
+.DS_Store
