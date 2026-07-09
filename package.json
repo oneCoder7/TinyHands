@@ -7,7 +7,8 @@
     "serve": "tsx src/main.ts",
     "dev": "tsx src/main.ts",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run"
+    "test": "vitest run",
+    "verify:crash": "tsx scripts/verify-crash-recovery.ts"
   },
   "dependencies": {
     "@alibaba-group/opensandbox": "^0.1.9",
