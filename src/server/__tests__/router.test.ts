@@ -1,9 +1,13 @@
 import { describe, it, expect, vi } from "vitest";
 import Fastify from "fastify";
 import type { FastifyInstance } from "fastify";
-import { registerRoutes } from "./router.js";
-import { ConversationManager } from "./conversation-manager.js";
-import type { SessionFactory } from "./agent-session.js";
+import { registerRoutes } from "../router.js";
+import { ConversationManager } from "../conversation-manager.js";
+import type { SessionFactory } from "../agent-session.js";
+import { FsEventStore } from "../../conversation/event-store.js";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 /**
  * router 测试 —— 用 Fastify inject() 做 HTTP 级测试。
@@ -20,7 +24,7 @@ async function buildApp(factoryOverride?: SessionFactory) {
       conversationId,
       conversation: {
         runtime: {} as any,
-        emit: () => {},
+        emit: async () => ({} as any),
         emitDelta: () => {},
         subscribe: () => {},
         getEvents: () => [],
@@ -31,6 +35,7 @@ async function buildApp(factoryOverride?: SessionFactory) {
       createdAt: Date.now(),
       running: false,
       runAbort: null,
+      runtimeStarted: false,
     }));
 
   const app = Fastify();
@@ -54,9 +59,12 @@ async function buildApp(factoryOverride?: SessionFactory) {
     }
   );
 
+  // 每个测试用独立的 tmp 目录,避免 list/恢复互相串扰
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "tinyhands-router-test-"));
   const manager = new ConversationManager({
-    workspaceRoot: "/tmp/tinyhands-test-workspaces",
+    workspaceRoot,
     createSession: factory,
+    eventStore: new FsEventStore(workspaceRoot),
   });
 
   registerRoutes(app, manager, () => 0);
@@ -130,7 +138,7 @@ describe("POST /conversations/create — tools 字段", () => {
         conversationId,
         conversation: {
           runtime: {} as any,
-          emit: () => {},
+          emit: async () => ({} as any),
           emitDelta: () => {},
           subscribe: () => {},
           getEvents: () => [],
@@ -141,6 +149,7 @@ describe("POST /conversations/create — tools 字段", () => {
         createdAt: Date.now(),
         running: false,
         runAbort: null,
+        runtimeStarted: false,
       };
     };
 

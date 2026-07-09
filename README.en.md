@@ -21,6 +21,7 @@ session management + live streaming.
 - **Autonomous tool loop** — a built-in ReAct loop: the agent picks a tool, sees the result, decides the next step, and repeats until it calls `finish`.
 - **Pluggable execution** — the same code runs on the host, in Docker, or in an OpenSandbox cloud sandbox, switched by a single environment variable.
 - **Live event stream** — every step (thinking, message, tool call, result) is pushed to subscribers, with replay-on-reconnect.
+- **Resumable sessions** — the event stream is persisted to disk; after a restart, a conversation is recovered by its id and history continues without losing context.
 - **Cooperative interrupt** — a run can be interrupted at any time; the agent stops cleanly at a checkpoint, leaving no half state.
 - **Streaming output** — token-level streaming, including live extended-thinking traces.
 
@@ -101,10 +102,11 @@ Full endpoints under [HTTP API](#http-api).
 
 These are what make it easy to extend and embed:
 
-- **The event stream is the single source of truth.** Conversation state *is* an
-  append-only event log; the context fed to the LLM is a pure projection of it.
-  That makes a conversation inherently auditable, replayable, and persistable —
-  storing or time-travel-debugging it means consuming just this one stream.
+- **The event stream is the single source of truth, and it's persisted.** Conversation state *is* an
+  append-only event log; the context fed to the LLM is a pure projection of it. Once the stream is
+  persisted to disk, a conversation is recovered by its id after a restart and history continues.
+  That makes a conversation inherently auditable, replayable — time-travel-debugging it means
+  consuming just this one stream.
 - **Runtime ≠ Sandbox; execution location is pluggable.** Tools only express
   intent ("run this command"); a `Runtime` decides where it runs. Host, Docker,
   and cloud sandbox share one set of tool code, switched with zero changes.
@@ -149,7 +151,6 @@ only on the interface.
 ## Roadmap
 
 - More built-in tools (web search, patch-based file editing, sub-task spawning)
-- Conversation persistence: store the event stream, resume after a restart
 - Full handling of `redacted_thinking` blocks (currently a known gap)
 - More provider implementations (native OpenAI protocol, etc.)
 - Finer-grained resource quotas (per-conversation exec timeout, budget caps)

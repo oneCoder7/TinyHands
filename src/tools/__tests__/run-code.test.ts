@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { runCodeTool } from "./run-code.js";
-import type { ToolContext } from "./tool.js";
-import type { Runtime } from "../runtime/runtime.js";
+import { runCodeTool } from "../run-code.js";
+import type { ToolContext } from "../tool.js";
+import type { Runtime } from "../../runtime/runtime.js";
 
 /** 构造一个 mock runtime,只实现 runCode */
 function mockRuntime(

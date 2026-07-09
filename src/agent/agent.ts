@@ -109,7 +109,7 @@ export class Agent {
       // 思考定稿入库(必须在 agent_message 之前 emit,投影才能把它折叠进同一条
       // assistant message 且 thinking 在前;否则多轮回传 400)。
       if (resp.thinkingBlocks?.length) {
-        conversation.emit({
+        await conversation.emit({
           type: "thinking_finished",
           source: "agent",
           blocks: resp.thinkingBlocks,
@@ -118,7 +118,7 @@ export class Agent {
 
       // —— 分支 3:max_tokens(这轮被截断,结果不可信),不做 continuation,直接返回 error
       if (resp.stopReason === "max_tokens") {
-        conversation.emit({
+        await conversation.emit({
           type: "error",
           source: "agent",
           message: "LLM 输出被截断(max_tokens)，本轮结果不可信",
@@ -136,14 +136,14 @@ export class Agent {
       //    却光说话不动手。怼一句给两条出路,继续循环(靠 max_step 兜底防死循环)
       if (resp.toolCalls.length === 0) {
         // 先记这轮文字(空文字也记,保留轨迹;投影时跳过空 assistant)
-        conversation.emit({
+        await conversation.emit({
           type: "agent_message",
           source: "agent",
           text: resp.text,
           toolCalls: [],
         });
         // 再 emit 一条 user 提示，给两条明确出路
-        conversation.emit({
+        await conversation.emit({
           type: "user_message",
           source: "user",
           text:
@@ -154,7 +154,7 @@ export class Agent {
       }
 
       // —— 有工具调用：先把 assistant 这轮（含 text + toolCalls）整体记进事件流
-      conversation.emit({
+      await conversation.emit({
         type: "agent_message",
         source: "agent",
         text: resp.text,
@@ -170,7 +170,7 @@ export class Agent {
         // 无论成败,先给 finish 的 tool_use 配一条 tool_result。完成语义由独立的
         // finished 事件承载,但 tool_use↔tool_result 配对是 Anthropic 硬约束:
         // 下一次 run 会重投影整条流,缺配对 → 孤儿 → 400。
-        conversation.emit({
+        await conversation.emit({
           type: "tool_result",
           source: "environment",
           toolCallId: result.toolCallId,
@@ -182,7 +182,7 @@ export class Agent {
         // 否则它们的 tool_use 同样成孤儿。给明确说明,isError 标记未执行。
         for (const tc of resp.toolCalls) {
           if (tc.id === finishCall.id) continue;
-          conversation.emit({
+          await conversation.emit({
             type: "tool_result",
             source: "environment",
             toolCallId: tc.id,
@@ -193,7 +193,7 @@ export class Agent {
 
         // finish 参数校验失败 → 不算完成,怼回去让它重来(配对已在上面补齐,可安全 continue)
         if (result.isError) {
-          conversation.emit({
+          await conversation.emit({
             type: "user_message",
             source: "user",
             text: "finish 调用的参数有误，请检查后重新调用 finish 工具。",
@@ -202,7 +202,7 @@ export class Agent {
         }
 
         // finish 成功 → emit finished 承载完成语义,随后 return 收尾
-        conversation.emit({
+        await conversation.emit({
           type: "finished",
           source: "agent",
           result: result.content,
@@ -224,7 +224,7 @@ export class Agent {
         //    工具自然结束后的这里生效。
         if (signal?.aborted) {
           for (const rest of resp.toolCalls.slice(i)) {
-            conversation.emit({
+            await conversation.emit({
               type: "tool_result",
               source: "environment",
               toolCallId: rest.id,
@@ -235,7 +235,7 @@ export class Agent {
           return interruptedResult();
         }
         const result = await this.executeToolCall(tc, ctx);
-        conversation.emit({
+        await conversation.emit({
           type: "tool_result",
           source: "environment",
           toolCallId: result.toolCallId,
@@ -252,7 +252,7 @@ export class Agent {
     if (signal?.aborted) return interruptedResult();
 
     // —— 撞 max_step 兜底
-    conversation.emit({
+    await conversation.emit({
       type: "error",
       source: "agent",
       message: `达到最大步数 ${this.maxStep}，任务未显式完成`,

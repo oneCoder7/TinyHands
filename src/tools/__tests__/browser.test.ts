@@ -1,7 +1,7 @@
 import { describe, it, expect } from "vitest";
-import { browserTool } from "./browser.js";
-import type { ToolContext } from "./tool.js";
-import type { Runtime } from "../runtime/runtime.js";
+import { browserTool } from "../browser.js";
+import type { ToolContext } from "../tool.js";
+import type { Runtime } from "../../runtime/runtime.js";
 
 /** 构造一个 mock runtime,只实现 runBrowser */
 function mockRuntime(

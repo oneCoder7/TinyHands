@@ -44,7 +44,7 @@ export function registerRoutes(
   // 健康探针(部署/编排要,保持 GET)
   fastify.get("/health", async () => ({
     status: "ok",
-    conversations: manager.list().length,
+    conversations: (await manager.list()).length,
   }));
 
   fastify.post("/conversations/create", async (req, reply) => {
@@ -77,7 +77,7 @@ export function registerRoutes(
   });
 
   fastify.post("/conversations/list", async () => ({
-    conversations: manager.list().map((s) => ({
+    conversations: (await manager.list()).map((s) => ({
       ...s,
       connections: getConnectionCount(s.conversationId),
     })),
@@ -106,12 +106,14 @@ export function registerRoutes(
       reply.code(400);
       return { error: "参数不合法：需要 conversationId 与非空 text" };
     }
-    const session = manager.get(parsed.data.conversationId);
+    const session = await manager.getOrResume(parsed.data.conversationId);
     if (!session) {
       reply.code(404);
       return { error: `conversation 不存在：${parsed.data.conversationId}` };
     }
-    submitUserMessage(session, parsed.data.text);
+    // await:user_message 的落盘失败需向调用方传播(设计定:真相源优先,落盘失败 →
+    // 不受理 → 上层映射 500),故不能 fire-and-forget。driveRun 仍是后台触发(内部兜底)。
+    await submitUserMessage(session, parsed.data.text);
     // driveRun 同步段已置位 running,此处读到的是受理后的即时状态
     return { accepted: true, running: session.running };
   });
@@ -123,11 +125,12 @@ export function registerRoutes(
       reply.code(400);
       return { error: "缺少 conversationId" };
     }
-    const session = manager.get(parsed.data.conversationId);
+    const session = await manager.getOrResume(parsed.data.conversationId);
     if (!session) {
       reply.code(404);
       return { error: `conversation 不存在：${parsed.data.conversationId}` };
     }
-    return { interrupted: interruptRun(session) };
+    // interrupted 事件落盘失败会向调用方抛出 → fastify 映射 500。符合「真相源优先」。
+    return { interrupted: await interruptRun(session) };
   });
 }

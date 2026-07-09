@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { assembleRunCodeResult } from "./opensandbox-runtime.js";
+import { assembleRunCodeResult } from "../opensandbox-runtime.js";
 import type { Execution } from "@alibaba-group/opensandbox";
 
 /**

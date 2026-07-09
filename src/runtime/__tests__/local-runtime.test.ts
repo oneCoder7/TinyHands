@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { LocalRuntime } from "./local-runtime.js";
+import { LocalRuntime } from "../local-runtime.js";
 import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";

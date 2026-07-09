@@ -7,6 +7,7 @@ import {
   type EventDraft,
   type EventHandler,
 } from "./events.js";
+import type { EventStore } from "./event-store.js";
 
 /**
  * Conversation —— 一次会话的聚合根,会话的边界与身份锚点。
@@ -15,20 +16,31 @@ import {
  * 读写分离:stream 私有,subscribe 是读的唯一出口,emit/emitDelta 是写(事实上只被
  * Agent 调)。不持有 Agent:agent.run(conversation),驱动器依赖数据、数据不依赖驱动器,
  * 换 agent 类型 conv 不动。
+ *
+ * 持久化:EventStream 接 EventStore 落盘。恢复场景经 initialEvents 灌入历史事件,
+ * runtime 保持惰性(首次 run 才 create),故「读回历史」不触发执行环境。
  */
 export class Conversation {
   readonly id: string;
   /** 会话的执行环境。只读暴露给 Agent 组装 ToolContext,构造时注入。 */
   readonly runtime: Runtime;
-  private readonly stream = new EventStream();
+  private readonly stream: EventStream;
 
-  constructor(id: string, runtime: Runtime) {
+  constructor(
+    id: string,
+    runtime: Runtime,
+    opts: { store?: EventStore; initialEvents?: Event[] } = {}
+  ) {
     this.id = id;
     this.runtime = runtime;
+    this.stream = new EventStream(opts.store, id, opts.initialEvents);
   }
 
-  /** 写侧:追加一个事件到真相源(id/timestamp 由 EventStream 注入)。 */
-  emit(draft: EventDraft): Event {
+  /**
+   * 写侧:追加一个事件到真相源(id/timestamp 由 EventStream 注入)。
+   * 异步:先落盘成功再广播,故调用方须 await(落盘失败会抛出)。
+   */
+  emit(draft: EventDraft): Promise<Event> {
     return this.stream.emit(draft);
   }
 

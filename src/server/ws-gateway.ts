@@ -52,18 +52,20 @@ export function registerWsGateway(
   fastify.get<{ Params: { convId: string }; Querystring: { lastSeq?: string } }>(
     "/ws/:convId",
     { websocket: true },
-    (socket: WebSocket, req) => {
+    async (socket: WebSocket, req) => {
       // 路径参数已由路由器 percent-decode,不要再手动 decodeURIComponent(会双重解码)
       const convId = req.params.convId;
 
       // 会话不存在:握手已完成,用应用级 close code 告知(可排查)
-      const session = manager.get(convId);
+      // 异步懒恢复:未加载的会话从磁盘 load(纯读,不起 runtime)。
+      const session = await manager.getOrResume(convId);
       if (!session) {
         log.warn({ conversationId: convId }, "连接了不存在的会话");
         socket.close(CLOSE_NOT_FOUND, "conversation not found");
         return;
       }
-
+      // await 期间客户端可能已断开:后续 send() 内部会查 readyState,这里不提前 return,
+      // 让 cleanup 路径统一处理(补发/订阅都会因 readyState 检查而 no-op)。
       const { conversation } = session;
       const connId = ++connSeq;
 

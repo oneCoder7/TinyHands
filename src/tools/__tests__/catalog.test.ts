@@ -1,9 +1,9 @@
 import { describe, it, expect } from "vitest";
-import { ToolRegistry } from "./tool.js";
-import { optionalToolCatalog, listOptionalToolNames } from "./catalog.js";
-import { readFileTool } from "./read-file.js";
-import { writeFileTool } from "./write-file.js";
-import { finishTool } from "./finish.js";
+import { ToolRegistry } from "../tool.js";
+import { optionalToolCatalog, listOptionalToolNames } from "../catalog.js";
+import { readFileTool } from "../read-file.js";
+import { writeFileTool } from "../write-file.js";
+import { finishTool } from "../finish.js";
 
 describe("optionalToolCatalog", () => {
   it("包含 run_bash / run_code / browser 三个可选工具", () => {

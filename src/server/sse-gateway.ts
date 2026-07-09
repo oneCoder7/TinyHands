@@ -75,11 +75,12 @@ export function registerSseGateway(
     // 服务端幽灵订阅污染 connections 计数(对抗评审实测确认)。路由级关掉:
     // HEAD /sse/:convId → 404,干净 HTTP 语义拒绝(与 S5 同精神)。
     { exposeHeadRoute: false },
-    (req, reply) => {
+    async (req, reply) => {
       const convId = req.params.convId;
 
       // —— ① 先查会话再 hijack:此时还是正常 fastify 响应,404 走标准管线(S5)
-      const session = manager.get(convId);
+      // 异步懒恢复:getOrResume 会从磁盘 load 未加载的会话(纯读,不起 runtime)。
+      const session = await manager.getOrResume(convId);
       if (!session) {
         log.warn({ conversationId: convId }, "连接了不存在的会话");
         reply.code(404).send({ error: `conversation not found: ${convId}` });

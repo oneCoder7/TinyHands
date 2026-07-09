@@ -4,6 +4,7 @@ import { logger } from "./core/logger.js";
 import { createLLMClient } from "./llm/factory.js";
 import { makeAgentSessionFactory } from "./server/agent-session.js";
 import { ConversationManager } from "./server/conversation-manager.js";
+import { FsEventStore } from "./conversation/event-store.js";
 import { startServer } from "./server/server.js";
 import { cleanupOrphanContainers } from "./runtime/docker-runtime.js";
 
@@ -13,12 +14,12 @@ import { cleanupOrphanContainers } from "./runtime/docker-runtime.js";
  *
  * 一个进程内可并存 N 个 conversation(各自独立的事件流/runtime/工作目录),
  * 生命周期(创建/销毁)由上层业务侧经 REST 控制 —— 上层要多少会话是它的事,
- * 这里只提供 per-conversation 的能力。启动时 0 个会话,全等上游创建。
+ * 这里只提供 per-conversation 的能力。启动时 0 个会话,全等上游创建(或从磁盘懒恢复)。
  *
  * 【组装职责】main 是全项目唯一的组装根,只做进程级绑定:读 config →
- * 造进程级共享的 LLM 客户端 → 把进程级依赖(llm/maxStep/runtime)注入会话装配工厂 →
- * 把工厂交给 manager → 启动 server。单个组件的 new 都在 llm/factory 与
- * server/agent-session 里,main 不碰。getConfig() 也只在此调用一次。
+ * 造进程级共享的 LLM 客户端 + EventStore → 把进程级依赖(llm/maxStep/runtime/store)
+ * 注入会话装配工厂 → 把工厂交给 manager → 启动 server。单个组件的 new 都在
+ * llm/factory 与 server/agent-session 里,main 不碰。getConfig() 也只在此调用一次。
  */
 async function main() {
   const cfg = getConfig();
@@ -29,6 +30,10 @@ async function main() {
   // LLM 客户端无会话状态,全进程共享一个(provider 接缝在 llm/factory)
   const llm = createLLMClient(cfg.llm);
 
+  // 事件持久化:全进程一个 EventStore 单例,按 conversationId 分文件落盘。
+  // 落 <workspaceRoot>/<id>/events.jsonl,与该会话 workspace 同目录。
+  const eventStore = new FsEventStore(cfg.workspaceRoot);
+
   // 进程级依赖注入一次,得到「拿数据造会话」的工厂;会话级数据(id/workspaceDir)
   // 在请求到达时由 manager 作参数传入
   const createSession = makeAgentSessionFactory({
@@ -37,11 +42,13 @@ async function main() {
     runtime: cfg.runtime,
     docker: cfg.docker,
     opensandbox: cfg.opensandbox,
+    eventStore,
   });
 
   const manager = new ConversationManager({
     workspaceRoot: cfg.workspaceRoot,
     createSession,
+    eventStore,
   });
 
   await startServer({ port: cfg.port, manager });
