@@ -160,7 +160,7 @@ export const myTool: Tool<MyArgs> = {
 | `LLM_BASE_URL`          | —                                    | 必填 —— Anthropic 风格网关地址           |
 | `LLM_MODEL`             | —                                    | 必填 —— 模型名                           |
 | `PORT`                  | `8787`                               |                                          |
-| `WORKSPACE_ROOT`        | `./workspaces`                       | 每会话在其下有专属子目录                 |
+| `TINYHANDS_HOME`        | `~`(即 `~/workspace`)              | 覆盖家目录;workspace → `$TINYHANDS_HOME/workspace`。仅开发/测试用,默认零配置 |
 | `LLM_MAX_TOKENS`        | `8192`                               |                                          |
 | `LLM_THINKING_BUDGET`   | `2048`                               | `0` 表示关闭 extended thinking           |
 | `MAX_STEP`              | `10`                                 | agent 循环上限                           |

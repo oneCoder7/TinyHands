@@ -1,3 +1,6 @@
+import { homedir } from "node:os";
+import { join } from "node:path";
+
 /**
  * 全局配置 —— 进程级单例,启动时从环境变量读一次并冻结(只读)。
  *
@@ -9,7 +12,18 @@
 export interface AppConfig {
   /** WS 服务端口 */
   port: number;
-  /** 会话工作目录的根:每个 conversation 在其下有专属子目录 {convId}/ */
+  /**
+   * 会话工作目录的根:每个 conversation 在其下有专属子目录 {convId}/。
+   *
+   * 路径收敛:默认 `~/workspace`,不可直接配置根目录。开发/测试可用
+   * `TINYHANDS_HOME` 覆盖家目录(取 `join($TINYHANDS_HOME, 'workspace')`),
+   * 避免污染真实家目录;生产不设即零配置。
+   *
+   * 语义(按机器分,非按目录名分):server 机器的此根放 events+meta(控制面);
+   * runtime 机器的等价 `~/workspace` 放执行产物(数据面)。Local 同机同目录
+   * = 接受不隔离(选 Local 即表示无不可信代码或业务方自管隔离);Docker/OpenSandbox
+   * 的产物在容器/云沙箱内,与本根天然物理分离。
+   */
   workspaceRoot: string;
   /** LLM 相关 */
   llm: {
@@ -69,7 +83,7 @@ function readConfig(): AppConfig {
 
   return {
     port: Number(process.env.PORT ?? 8787),
-    workspaceRoot: process.env.WORKSPACE_ROOT ?? `${process.cwd()}/workspaces`,
+    workspaceRoot: join(process.env.TINYHANDS_HOME ?? homedir(), "workspace"),
     llm: {
       provider: process.env.LLM_PROVIDER ?? "anthropic",
       apiKey,

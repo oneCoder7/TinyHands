@@ -15,7 +15,7 @@
  *       LLM 不可达时脚本会降级:agent.run 报 error 落盘,仍验恢复+续号,但不产生 tool_use。
  *
  * 黑盒:不 import 项目内部模块,只通过 HTTP + SSE + 直接读 events.jsonl 交互。
- * 隔离:WORKSPACE_ROOT 用临时目录,不污染项目 ./workspaces;RUNTIME 强制 local(免 docker 依赖)。
+ * 隔离:TINYHANDS_HOME 用临时目录,不污染真实家目录 ~/workspace;RUNTIME 强制 local(免 docker 依赖)。
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { mkdtempSync, rmSync, readFileSync, existsSync, openSync } from "node:fs";
@@ -81,7 +81,7 @@ function startService(tag: string, tmpRoot: string): { child: ChildProcess; logP
     env: {
       ...process.env,
       PORT: String(PORT),
-      WORKSPACE_ROOT: tmpRoot,
+      TINYHANDS_HOME: tmpRoot,
       RUNTIME: "local", // 强制本机,免 docker 依赖
     },
     stdio: ["ignore", logFd, logFd],

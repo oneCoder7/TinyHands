@@ -180,7 +180,7 @@ Everything is read once from the environment at startup (see `.env.example`).
 | `LLM_BASE_URL`          | —                                    | required — Anthropic-style gateway URL   |
 | `LLM_MODEL`             | —                                    | required — model name                    |
 | `PORT`                  | `8787`                               |                                          |
-| `WORKSPACE_ROOT`        | `./workspaces`                       | per-conversation subdir under it         |
+| `TINYHANDS_HOME`        | `~` (i.e. `~/workspace`)             | override home dir; workspace → `$TINYHANDS_HOME/workspace`. dev/test only, zero-config in prod |
 | `LLM_MAX_TOKENS`        | `8192`                               |                                          |
 | `LLM_THINKING_BUDGET`   | `2048`                               | `0` disables extended thinking           |
 | `MAX_STEP`              | `10`                                 | agent loop cap                           |

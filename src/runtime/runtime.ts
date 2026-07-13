@@ -1,10 +1,20 @@
 /**
- * Runtime —— 「执行环境」的抽象接口。把「工具在哪执行」从「工具是什么」里解耦。
- * 工具只表达意图(跑命令/读写文件),执行位置由具体实现决定。
+ * Runtime —— 「执行环境」的 RPC 边界接口。
+ *
+ * 把「工具在哪执行」从「工具是什么」里解耦:工具只表达意图(跑命令/读写文件),
+ * 在哪执行由具体实现决定。调用方 = server 侧的 tool.execute;执行方 = runtime 侧
+ * (Local=server 进程内 / Docker=容器内 execd / OpenSandbox/E2B=云沙箱)。三种实现
+ * 即三种 transport:进程内直接调用、HTTP 私有协议、SDK。接口签名即 RPC 契约,
+ * 新增沙箱后端 = 实现本接口,不动 Agent loop、不动工具。
  *
  * 同时管 exec + 文件读写:容器内执行时命令产生的文件在容器内,读写若走宿主 fs 会
  * 文件系统分裂,故一次切对边界。Runtime ≠ Sandbox:本身不含隔离,LocalRuntime 就是
- * 本机裸跑;带隔离的实现(DockerRuntime)才引入沙箱。
+ * 本机裸跑;带隔离的实现(DockerRuntime / OpenSandboxRuntime)才引入沙箱。
+ *
+ * 边界语义(按机器分,非按目录名分):server 机器的 ~/workspace 放 events+meta
+ * (控制面);runtime 机器的等价 ~/workspace 放执行产物(数据面)。Local 同机同目录
+ * = 接受不隔离(选 Local 即表示无不可信代码或业务方自管隔离);Docker/OpenSandbox
+ * 的产物在容器/云沙箱内,与 server 侧 events 天然物理分离。
  *
  * 生命周期:create 必须在 exec/readFile/writeFile 之前调用,kill 之后不得再调执行面
  * 方法。LocalRuntime 的 create/kill 为 no-op;DockerRuntime 的 create = 建+启容器+等
