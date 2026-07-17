@@ -10,7 +10,7 @@
  * 前置:本地 OpenSandbox server(localhost:8080)已起、code-interpreter 镜像已拉。
  * 运行:npx tsx scripts/verify-opensandbox-jupyter.ts
  */
-import { OpenSandboxRuntime } from "../src/runtime/opensandbox-runtime.js";
+import { OpenSandboxRuntime } from "../packages/server/src/runtime/opensandbox-runtime.js";
 
 function line(title: string) {
   console.log("\n" + "═".repeat(60) + "\n" + title + "\n" + "═".repeat(60));

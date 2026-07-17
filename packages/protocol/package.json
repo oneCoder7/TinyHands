@@ -1,0 +1,28 @@
+{
+  "name": "@tinyhands/protocol",
+  "version": "0.1.0",
+  "description": "Versioned public protocol types for Tinyhands",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.js.map",
+    "dist/**/*.d.ts",
+    "dist/**/*.d.ts.map"
+  ],
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "clean": "node ../../scripts/clean-build.mjs protocol",
+    "prebuild": "npm run clean",
+    "build": "tsc -b",
+    "prepack": "npm run build"
+  }
+}

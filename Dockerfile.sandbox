@@ -16,7 +16,7 @@ LABEL tinyhands.component="sandbox"
 RUN mkdir -p /workspace
 
 # 复制 execd server(单文件,无依赖)
-COPY src/runtime/execd/server.js /opt/execd/server.js
+COPY packages/server/src/runtime/execd/server.js /opt/execd/server.js
 
 EXPOSE 44772
 

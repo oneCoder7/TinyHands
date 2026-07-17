@@ -7,11 +7,12 @@
  *  - 要真起服务进程 + 真 kill -9 + 重启 —— vitest 进程内做不到进程级崩溃;
  *  - 价值在「证明」而非「回归」:验设计文档 §5 的核心假设「appendFile 只到 page cache,
  *    kill -9/OOM 由 OS 兜底刷盘不丢」,以及 §6 验收1「进程 kill → 重启 → 同 id 拿回完整历史」。
- *    集成测试(conversation-manager.test.ts)是「丢内存实例再 new 一个」模拟崩溃,逻辑等价
+ *    集成测试(conversation-service.test.ts)是「丢内存实例再 new 一个」模拟崩溃,逻辑等价
  *    但从未跨过真进程边界、没用真 kill -9 —— 本脚本补这一层。
  *
- * 跑法:tsx scripts/verify-crash-recovery.ts
- * 前提:.env 已配 ANTHROPIC_AUTH_TOKEN / LLM_BASE_URL / LLM_MODEL(真 LLM 可达)。
+ * 跑法:npm run verify:crash
+ * 前提:.env 已按 provider/model 配置 LLM_MODEL 和可用 API key；私有网关还需
+ *       LLM_BASE_URL，OpenAI-compatible Chat 网关需 LLM_OPENAI_API_MODE=chat_completions。
  *       LLM 不可达时脚本会降级:agent.run 报 error 落盘,仍验恢复+续号,但不产生 tool_use。
  *
  * 黑盒:不 import 项目内部模块,只通过 HTTP + SSE + 直接读 events.jsonl 交互。
@@ -76,17 +77,21 @@ const post = (path: string, body: unknown) =>
 function startService(tag: string, tmpRoot: string): { child: ChildProcess; logPath: string } {
   const logPath = join(tmpRoot, `service-${tag}.log`);
   const logFd = openSync(logPath, "w");
-  const child = spawn(process.execPath, ["--import", "tsx", "src/main.ts"], {
-    cwd: PROJECT_ROOT,
-    env: {
-      ...process.env,
-      PORT: String(PORT),
-      TINYHANDS_HOME: tmpRoot,
-      RUNTIME: "local", // 强制本机,免 docker 依赖
-    },
-    stdio: ["ignore", logFd, logFd],
-    detached: true,
-  });
+  const child = spawn(
+    process.execPath,
+    ["--import", "tsx", "apps/standalone/src/main.ts"],
+    {
+      cwd: PROJECT_ROOT,
+      env: {
+        ...process.env,
+        PORT: String(PORT),
+        TINYHANDS_HOME: tmpRoot,
+        RUNTIME: "local", // 强制本机,免 docker 依赖
+      },
+      stdio: ["ignore", logFd, logFd],
+      detached: true,
+    }
+  );
   child.on("exit", (code, sig) => {
     console.log(`  [service-${tag}] 退出 code=${code} sig=${sig}`);
   });
@@ -170,9 +175,10 @@ async function* sseStream(convId: string, lastSeq: number, signal: AbortSignal) 
   }
 }
 
-/** 直接读磁盘 events.jsonl(真相源)。脚本自己 parse,不耦合 EventStore。返回完整事件对象。 */
-function readDiskEvents(tmpRoot: string, convId: string): Array<{ type: string; seq: number; message?: string }> {
-  const f = join(tmpRoot, convId, "events.jsonl");
+/** 直接读磁盘 events.jsonl(真相源)。脚本自己 parse,不耦合 ConversationStore。 */
+function readDiskEvents(tinyhandsHome: string, convId: string): Array<{ type: string; seq: number; message?: string }> {
+  // readConfig 把 TINYHANDS_HOME 解释为 home，再固定追加 workspace/。
+  const f = join(tinyhandsHome, "workspace", convId, "events.jsonl");
   if (!existsSync(f)) return [];
   return readFileSync(f, "utf8")
     .split("\n")
