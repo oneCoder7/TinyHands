@@ -11,6 +11,7 @@ import {
   toOpenAIChatMessages,
   toOpenAIChatTools,
 } from "./openai-mappers.js";
+import { normalizeLLMRequestError } from "./llm-request-error.js";
 
 type ChatParams = Omit<ChatCompletionCreateParamsNonStreaming, "stream">;
 
@@ -50,6 +51,19 @@ export class OpenAIChatCompletionsClient implements LLMClient {
     messages: Message[],
     tools: Tool[],
     opts: ChatOptions = {}
+  ): Promise<LLMResponse> {
+    try {
+      return await this.request(messages, tools, opts);
+    } catch (error) {
+      if (opts.signal?.aborted) throw error;
+      throw normalizeLLMRequestError(error);
+    }
+  }
+
+  private async request(
+    messages: Message[],
+    tools: Tool[],
+    opts: ChatOptions
   ): Promise<LLMResponse> {
     const mappedTools = toOpenAIChatTools(tools);
     const params: ChatParams = {

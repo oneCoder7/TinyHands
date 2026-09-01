@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod/v4";
-import { Agent } from "../agent.js";
+import { createAgent } from "../create-agent.js";
 import { Conversation } from "../../conversation/conversation.js";
+import { createTestConversation } from "../../conversation/__tests__/conversation-fixture.js";
 import { projectCompactedContext } from "../../conversation/events.js";
 import type { LLMClient } from "../../llm/llm-client.js";
 import type { LLMResponse, Message } from "../../llm/types.js";
@@ -9,8 +10,8 @@ import { RunJournal, type RunLogRecord } from "../../observability/run-log.js";
 import type { RunLogStore } from "../../observability/run-log-store.js";
 import type { Runtime } from "../../runtime/runtime.js";
 import { ToolRegistry, type Tool } from "../../tools/tool.js";
-import { CompactionError } from "../context-compactor.js";
-import { createBuiltInAgentLifecycle } from "../agent-lifecycle.js";
+import { CompactionError } from "../context/context-compactor.js";
+import type { ContextCompactor } from "../context/context-compactor.js";
 
 class MemoryRunLogStore implements RunLogStore {
   records: RunLogRecord[] = [];
@@ -58,11 +59,33 @@ function response(overrides: Partial<LLMResponse> = {}): LLMResponse {
 const TEST_RUNTIME = {} as Runtime;
 
 function conversation(): Conversation {
-  return new Conversation("c1");
+  return createTestConversation("c1");
 }
 
 function runContext(signal?: AbortSignal) {
-  return { runId: "run-1", runtime: TEST_RUNTIME, signal };
+  return { runId: "run-1", signal };
+}
+
+function testAgent(
+  llm: LLMClient,
+  tools: ToolRegistry,
+  journal: RunJournal,
+  conv: Conversation,
+  options: {
+    maxStep?: number;
+    compactor?: Pick<ContextCompactor, "prepare">;
+  } = {}
+) {
+  return createAgent({
+    conversation: conv,
+    runtime: TEST_RUNTIME,
+    llm,
+    tools,
+    journal,
+    maxStep: options.maxStep ?? 1,
+    maxModelAttemptsPerStep: 1,
+    compactor: options.compactor,
+  }).agent;
 }
 
 describe("Agent Run Log", () => {
@@ -84,11 +107,9 @@ describe("Agent Run Log", () => {
       }),
     };
 
-    const result = await new Agent(llm, new ToolRegistry(), {
-      maxStep: 1,
-      journal,
-      lifecycle: createBuiltInAgentLifecycle({ compactor }),
-    }).run(conv, runContext());
+    const result = await testAgent(llm, new ToolRegistry(), journal, conv, {
+      compactor,
+    }).run(runContext());
 
     expect(result).toMatchObject({
       status: "error",
@@ -151,10 +172,12 @@ describe("Agent Run Log", () => {
       triggerId: "trigger-2",
     });
 
-    const result = await new Agent(llm, new ToolRegistry().register(finish), {
-      maxStep: 1,
+    const result = await testAgent(
+      llm,
+      new ToolRegistry().register(finish),
       journal,
-    }).run(conv, runContext());
+      conv
+    ).run(runContext());
 
     expect(result.status).toBe("completed");
     expect(finishExecute).toHaveBeenCalledOnce();
@@ -208,10 +231,9 @@ describe("Agent Run Log", () => {
       triggerId: "trigger-1",
     });
 
-    const result = await new Agent(llm, new ToolRegistry(), {
-      maxStep: 1,
-      journal,
-    }).run(conv, runContext(controller.signal));
+    const result = await testAgent(llm, new ToolRegistry(), journal, conv).run(
+      runContext(controller.signal)
+    );
 
     expect(result.status).toBe("interrupted");
     expect(store.records.find((record) => record.type === "llm_completed")).toMatchObject({
@@ -240,10 +262,9 @@ describe("Agent Run Log", () => {
     const conv = conversation();
     await conv.emit({ type: "user_message", source: "user", text: "go" });
 
-    const result = await new Agent(llm, new ToolRegistry(), {
-      maxStep: 1,
-      journal,
-    }).run(conv, runContext(controller.signal));
+    const result = await testAgent(llm, new ToolRegistry(), journal, conv).run(
+      runContext(controller.signal)
+    );
 
     expect(result.status).toBe("interrupted");
     expect(store.records.find((record) => record.type === "llm_failed")).toMatchObject({
@@ -268,12 +289,13 @@ describe("Agent Run Log", () => {
     const conv = conversation();
     await conv.emit({ type: "user_message", source: "user", text: "go" });
 
-    await expect(
-      new Agent(llm, new ToolRegistry(), { maxStep: 1, journal }).run(
-        conv,
-        runContext()
-      )
-    ).rejects.toThrow("provider down");
+    const result = await testAgent(llm, new ToolRegistry(), journal, conv).run(
+      runContext()
+    );
+    expect(result).toMatchObject({
+      status: "error",
+      error: "模型请求失败：unknown",
+    });
 
     expect(store.records.find((record) => record.type === "llm_failed")).toMatchObject({
       reason: "provider_error",
@@ -303,10 +325,9 @@ describe("Agent Run Log", () => {
     const conv = conversation();
     await conv.emit({ type: "user_message", source: "user", text: "go" });
 
-    const result = await new Agent(llm, new ToolRegistry(), {
-      maxStep: 1,
-      journal,
-    }).run(conv, runContext());
+    const result = await testAgent(llm, new ToolRegistry(), journal, conv).run(
+      runContext()
+    );
 
     expect(result.status).toBe("error");
     expect(store.records.find((record) => record.type === "llm_completed")).toMatchObject({
@@ -350,10 +371,12 @@ describe("Agent Run Log", () => {
     const conv = conversation();
     await conv.emit({ type: "user_message", source: "user", text: "go" });
 
-    const result = await new Agent(llm, new ToolRegistry().register(tool), {
-      maxStep: 1,
+    const result = await testAgent(
+      llm,
+      new ToolRegistry().register(tool),
       journal,
-    }).run(conv, runContext());
+      conv
+    ).run(runContext());
 
     expect(result).toMatchObject({ status: "error", error: errorMessage });
     expect(execute).not.toHaveBeenCalled();
@@ -379,10 +402,9 @@ describe("Agent Run Log", () => {
     const conv = conversation();
     await conv.emit({ type: "user_message", source: "user", text: "go" });
 
-    const result = await new Agent(llm, new ToolRegistry(), {
-      maxStep: 1,
-      journal,
-    }).run(conv, runContext(controller.signal));
+    const result = await testAgent(llm, new ToolRegistry(), journal, conv).run(
+      runContext(controller.signal)
+    );
 
     expect(result.status).toBe("interrupted");
     expect(llm.chat).not.toHaveBeenCalled();
@@ -417,10 +439,12 @@ describe("Agent Run Log", () => {
     const conv = conversation();
     await conv.emit({ type: "user_message", source: "user", text: "go" });
 
-    const result = await new Agent(llm, new ToolRegistry().register(finish), {
-      maxStep: 1,
+    const result = await testAgent(
+      llm,
+      new ToolRegistry().register(finish),
       journal,
-    }).run(conv, runContext());
+      conv
+    ).run(runContext());
 
     expect(result.status).toBe("completed");
     expect(conv.getEvents().map((event) => event.type)).toEqual([
@@ -465,10 +489,13 @@ describe("Agent Run Log", () => {
     const conv = conversation();
     await conv.emit({ type: "user_message", source: "user", text: "go" });
 
-    const result = await new Agent(llm, new ToolRegistry().register(finish), {
-      maxStep: 2,
+    const result = await testAgent(
+      llm,
+      new ToolRegistry().register(finish),
       journal,
-    }).run(conv, runContext());
+      conv,
+      { maxStep: 2 }
+    ).run(runContext());
 
     expect(result).toMatchObject({ status: "completed", result: "done" });
     expect(finishExecute).toHaveBeenCalledOnce();
@@ -525,10 +552,13 @@ describe("Agent Run Log", () => {
     const conv = conversation();
     await conv.emit({ type: "user_message", source: "user", text: "go" });
 
-    const result = await new Agent(llm, new ToolRegistry().register(finish), {
-      maxStep: 2,
+    const result = await testAgent(
+      llm,
+      new ToolRegistry().register(finish),
       journal,
-    }).run(conv, runContext());
+      conv,
+      { maxStep: 2 }
+    ).run(runContext());
 
     expect(result.status).toBe("completed");
     expect(llm.chat).toHaveBeenCalledTimes(2);
@@ -589,11 +619,12 @@ describe("Agent Run Log", () => {
     const conv = conversation();
     await conv.emit({ type: "user_message", source: "user", text: "go" });
 
-    const result = await new Agent(
+    const result = await testAgent(
       llm,
       new ToolRegistry().register(first).register(second),
-      { maxStep: 1, journal }
-    ).run(conv, runContext(controller.signal));
+      journal,
+      conv
+    ).run(runContext(controller.signal));
 
     expect(result.status).toBe("interrupted");
     expect(firstExecute).toHaveBeenCalledOnce();
@@ -637,10 +668,12 @@ describe("Agent Run Log", () => {
     const conv = conversation();
     await conv.emit({ type: "user_message", source: "user", text: "go" });
 
-    const result = await new Agent(llm, new ToolRegistry().register(tool), {
-      maxStep: 1,
+    const result = await testAgent(
+      llm,
+      new ToolRegistry().register(tool),
       journal,
-    }).run(conv, runContext(controller.signal));
+      conv
+    ).run(runContext(controller.signal));
 
     expect(result.status).toBe("interrupted");
     expect(conv.getEvents().some((event) => event.type === "error")).toBe(false);
@@ -692,11 +725,13 @@ describe("Agent Run Log", () => {
       }),
     };
 
-    const result = await new Agent(llm, new ToolRegistry().register(finish), {
-      maxStep: 1,
+    const result = await testAgent(
+      llm,
+      new ToolRegistry().register(finish),
       journal,
-      lifecycle: createBuiltInAgentLifecycle({ compactor }),
-    }).run(conv, runContext());
+      conv,
+      { compactor }
+    ).run(runContext());
 
     expect(result).toMatchObject({ status: "completed", projectedThroughSeq: 1 });
     expect(store.records.find((record) => record.type === "step_started")).toMatchObject({

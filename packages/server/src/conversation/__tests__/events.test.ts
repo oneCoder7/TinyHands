@@ -11,6 +11,7 @@ import type { EventAppender } from "../conversation-store.js";
 import type { Delta } from "../../llm/types.js";
 import type { ProviderReplayState } from "../../llm/types.js";
 import { Conversation } from "../conversation.js";
+import { createTestConversation } from "./conversation-fixture.js";
 
 /**
  * EventStream 持久化行为测试 + findUnmatchedToolCalls 恢复补偿测试。
@@ -527,7 +528,7 @@ describe("findUnmatchedToolCalls — 恢复时的孤儿补偿", () => {
   });
 
   it("Human Interaction 公开但裁剪 continuation，dispatch 与恢复坐标不公开", async () => {
-    const conversation = new Conversation("public-hil");
+    const conversation = createTestConversation("public-hil");
     await conversation.emit({
       type: "agent_message",
       source: "agent",

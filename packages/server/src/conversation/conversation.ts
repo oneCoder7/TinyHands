@@ -10,6 +10,10 @@ import {
 } from "./events.js";
 import type { EventAppender } from "./conversation-store.js";
 import type { TinyhandsLogger } from "../logging/logger.js";
+import type {
+  ConversationConfig,
+  ConversationMetadata,
+} from "./conversation-metadata.js";
 
 /**
  * Conversation —— 一次会话的聚合根,会话的边界与身份锚点。
@@ -23,19 +27,36 @@ import type { TinyhandsLogger } from "../logging/logger.js";
  * Runtime 的惰性创建与释放属于 AgentSession，故「读回历史」不触发执行环境。
  */
 export class Conversation {
-  readonly id: string;
+  readonly metadata: ConversationMetadata;
   private readonly stream: EventStream;
 
   constructor(
-    id: string,
+    metadata: ConversationMetadata,
     opts: {
       store?: EventAppender;
-      initialEvents?: Event[];
+      initialEvents?: readonly Event[];
       logger?: TinyhandsLogger;
     } = {}
   ) {
-    this.id = id;
-    this.stream = new EventStream(opts.store, id, opts.initialEvents, opts.logger);
+    this.metadata = metadata;
+    this.stream = new EventStream(
+      opts.store,
+      metadata.conversationId,
+      opts.initialEvents ? [...opts.initialEvents] : undefined,
+      opts.logger
+    );
+  }
+
+  get id(): string {
+    return this.metadata.conversationId;
+  }
+
+  get createdAt(): number {
+    return this.metadata.createdAt;
+  }
+
+  get config(): Readonly<ConversationConfig> {
+    return this.metadata.config;
   }
 
   /**

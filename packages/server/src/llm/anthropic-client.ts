@@ -10,6 +10,7 @@ import type {
   ThinkingBlock,
 } from "./types.js";
 import type { Tool } from "../tools/tool.js";
+import { normalizeLLMRequestError } from "./llm-request-error.js";
 
 /**
  * AnthropicClient —— LLMClient 的默认实现。全项目唯一 import @anthropic-ai/sdk 的
@@ -53,6 +54,19 @@ export class AnthropicClient implements LLMClient {
     messages: Message[],
     tools: Tool[],
     opts: ChatOptions = {}
+  ): Promise<LLMResponse> {
+    try {
+      return await this.request(messages, tools, opts);
+    } catch (error) {
+      if (opts.signal?.aborted) throw error;
+      throw normalizeLLMRequestError(error);
+    }
+  }
+
+  private async request(
+    messages: Message[],
+    tools: Tool[],
+    opts: ChatOptions
   ): Promise<LLMResponse> {
     // —— 入向翻译:中性 Message[] → Anthropic messages[]
     const anthropicMessages = messages

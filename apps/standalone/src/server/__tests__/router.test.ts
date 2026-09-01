@@ -5,9 +5,11 @@ import { registerRoutes } from "../router.js";
 import { DefaultConversationService } from "../../../../../packages/server/src/server/conversation-service.js";
 import {
   AgentSession,
-  type SessionFactory,
 } from "../../../../../packages/server/src/server/agent-session.js";
+import type { AgentSessionFactory } from "../../../../../packages/server/src/server/agent-session-factory.js";
 import { FsConversationStore } from "../../../../../packages/server/src/conversation/conversation-store.js";
+import { Conversation } from "../../../../../packages/server/src/conversation/conversation.js";
+import { TEST_CONVERSATION_DEFAULTS } from "../../../../../packages/server/src/conversation/__tests__/conversation-fixture.js";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -20,22 +22,15 @@ import { join } from "node:path";
  */
 
 /** 构造一个最小可用的测试 Fastify 实例 + mock manager */
-async function buildApp(factoryOverride?: SessionFactory) {
-  const factory: SessionFactory =
+async function buildApp(factoryOverride?: AgentSessionFactory) {
+  const factory: AgentSessionFactory =
     factoryOverride ??
-    (async ({ conversationId }) => new AgentSession({
-      conversationId,
-      conversation: {
-        emit: async () => ({} as any),
-        emitDelta: () => {},
-        subscribe: () => {},
-        getEvents: () => [],
-        getEventsSince: () => [],
-      } as any,
+    (async ({ metadata }) => new AgentSession({
+      conversation: new Conversation(metadata),
       agent: {} as any,
+      recovery: { recover: async () => undefined } as any,
       journal: { recoverOpenRuns: async () => {} } as any,
       runtime: { start: async () => {}, close: async () => {} } as any,
-      conversationCreatedAt: Date.now(),
     }));
 
   const app = Fastify();
@@ -65,6 +60,7 @@ async function buildApp(factoryOverride?: SessionFactory) {
     workspaceRoot,
     createSession: factory,
     conversationStore: new FsConversationStore(workspaceRoot),
+    conversationDefaults: TEST_CONVERSATION_DEFAULTS,
   });
 
   registerRoutes(app, manager);
@@ -132,21 +128,14 @@ describe("POST /conversations/create — tools 字段", () => {
 
   it("tools 透传到 SessionFactory", async () => {
     let capturedTools: string[] | undefined;
-    const factory: SessionFactory = async ({ conversationId, tools }) => {
-      capturedTools = tools;
+    const factory: AgentSessionFactory = async ({ metadata }) => {
+      capturedTools = metadata.config.tools;
       return new AgentSession({
-        conversationId,
-        conversation: {
-          emit: async () => ({} as any),
-          emitDelta: () => {},
-          subscribe: () => {},
-          getEvents: () => [],
-          getEventsSince: () => [],
-        } as any,
+        conversation: new Conversation(metadata),
         agent: {} as any,
+        recovery: { recover: async () => undefined } as any,
         journal: { recoverOpenRuns: async () => {} } as any,
         runtime: { start: async () => {}, close: async () => {} } as any,
-        conversationCreatedAt: Date.now(),
       });
     };
 
@@ -162,25 +151,21 @@ describe("POST /conversations/create — tools 字段", () => {
 
 describe("POST /conversations/send — triggerId", () => {
   it("响应 triggerId 与持久化 user_message 一致", async () => {
-    let emitted: Record<string, unknown> | undefined;
-    const factory: SessionFactory = async ({ conversationId }) => new AgentSession({
-      conversationId,
-      conversation: {
-        emit: async (draft: Record<string, unknown>) => {
-          emitted = draft;
-          return { ...draft, id: "evt-1", seq: 1, timestamp: Date.now() } as any;
-        },
-        emitDelta: () => {},
-        subscribe: () => {},
-        getEvents: () => [],
-        getEventsSince: () => [],
-      } as any,
-      // 保持 driver pending：该测试只验证 HTTP receipt，不执行 Agent 行为。
-      agent: { run: async () => await new Promise(() => {}) } as any,
-      journal: { append: async () => {}, getRecords: () => [] } as any,
-      runtime: { start: async () => {}, close: async () => {} } as any,
-      conversationCreatedAt: Date.now(),
-    });
+    let emitted: unknown;
+    const factory: AgentSessionFactory = async ({ metadata }) => {
+      const conversation = new Conversation(metadata);
+      conversation.subscribe((item) => {
+        if (!("delta" in item) && item.type === "user_message") emitted = item;
+      });
+      return new AgentSession({
+        conversation,
+        // 保持 driver pending：该测试只验证 HTTP receipt，不执行 Agent 行为。
+        agent: { run: async () => await new Promise(() => {}) } as any,
+        recovery: { recover: async () => undefined } as any,
+        journal: { append: async () => {}, getRecords: () => [] } as any,
+        runtime: { start: async () => {}, close: async () => {} } as any,
+      });
+    };
     const { app } = await buildApp(factory);
     await app.inject({
       method: "POST",

@@ -1,5 +1,5 @@
 import {
-  ConversationRecordExistsError,
+  ConversationMetadataExistsError,
   ConversationRecoveryError,
 } from "../conversation/conversation-store.js";
 import {
@@ -381,7 +381,7 @@ function mapError(error: unknown): Response {
   }
   if (
     error instanceof ConversationExistsError ||
-    error instanceof ConversationRecordExistsError
+    error instanceof ConversationMetadataExistsError
   ) {
     return protocolError(409, "conversation_exists", error.message);
   }

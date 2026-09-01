@@ -123,6 +123,8 @@ const CanonicalRunLogRecordSchema = z
           "invalid_summary",
           "summary_too_large",
           "persistence_error",
+          "agent_error",
+          // schema v1 compatibility; new code writes agent_error.
           "lifecycle_error",
         ])
         .optional(),
@@ -160,6 +162,8 @@ const CanonicalRunLogRecordSchema = z
       reason: z.enum([
         "user_interrupt",
         "finish_called",
+        "agent_error",
+        // schema v1 compatibility; new code writes agent_error.
         "lifecycle_error",
         "approval_rejected",
         "policy_denied",

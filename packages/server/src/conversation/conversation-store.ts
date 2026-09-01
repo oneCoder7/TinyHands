@@ -15,23 +15,45 @@ import {
   type TinyhandsLogger,
 } from "../logging/logger.js";
 import type { Event } from "./events.js";
+import type {
+  ConversationMetadata,
+  LegacyConversationMetadata,
+  StoredConversationMetadata,
+} from "./conversation-metadata.js";
 
 const EVENTS_FILE = "events.jsonl";
 const META_FILE = "meta.json";
 
-export interface ConversationRecord {
-  schemaVersion: 1;
-  conversationId: string;
-  createdAt: number;
-  tools?: string[];
-}
-
-const ConversationRecordSchema = z
+const LegacyConversationMetadataSchema = z
   .object({
     schemaVersion: z.literal(1),
     conversationId: z.string().min(1),
     createdAt: z.number().int().nonnegative(),
     tools: z.array(z.string()).optional(),
+  })
+  .strict();
+
+const ConversationMetadataSchema = z
+  .object({
+    schemaVersion: z.literal(2),
+    conversationId: z.string().min(1),
+    createdAt: z.number().int().nonnegative(),
+    config: z
+      .object({
+        tools: z.array(z.string()),
+        maxSteps: z.number().int().positive(),
+        maxModelAttemptsPerStep: z.number().int().positive(),
+        autoCompact: z
+          .object({
+            enabled: z.boolean(),
+            contextWindow: z.number().int().positive(),
+            triggerRatio: z.number().positive().max(1),
+            targetRatio: z.number().positive().max(1),
+            maxOutputTokens: z.number().int().positive(),
+          })
+          .strict(),
+      })
+      .strict(),
   })
   .strict();
 
@@ -42,9 +64,9 @@ const LegacyMetaSchema = z
   })
   .strict();
 
-export class ConversationRecordExistsError extends Error {
+export class ConversationMetadataExistsError extends Error {
   constructor(conversationId: string) {
-    super(`conversation record 已存在：${conversationId}`);
+    super(`conversation metadata 已存在：${conversationId}`);
   }
 }
 
@@ -59,15 +81,17 @@ export interface EventAppender {
   appendEvent(conversationId: string, event: Event): Promise<void>;
 }
 
-/** Conversation 的记录、事件与存在性由同一套 Store 负责。 */
+/** Conversation 的 metadata、事件与存在性由同一套 Store 负责。 */
 export interface ConversationStore extends EventAppender {
   /** 排他创建 metadata；已存在必须失败。 */
-  create(record: ConversationRecord): Promise<void>;
+  create(metadata: ConversationMetadata): Promise<void>;
+  /** 原子替换 metadata；仅用于受控 schema 迁移。 */
+  replaceMetadata(metadata: ConversationMetadata): Promise<void>;
   exists(conversationId: string): Promise<boolean>;
-  list(): Promise<ConversationRecord[]>;
+  list(): Promise<StoredConversationMetadata[]>;
   load(
     conversationId: string
-  ): Promise<{ record: ConversationRecord; events: Event[] } | undefined>;
+  ): Promise<{ metadata: StoredConversationMetadata; events: Event[] } | undefined>;
   /** 删除整个 Conversation 目录，包含事件、run log 与 Local workspace。 */
   delete(conversationId: string): Promise<void>;
 }
@@ -77,7 +101,8 @@ export interface ConversationStore extends EventAppender {
  *
  * meta.json 是 Conversation 的存在性记录；events.jsonl 是 append-only 事件流。
  * 兼容旧数据：旧 meta 会原地升级为 schemaVersion=1；只有 events 的会话会依据首条
- * event 生成 record。meta 存在但损坏时明确失败，禁止静默换成默认 tools。
+ * event 生成 legacy metadata。v1 → v2 的 effective config 迁移由 Service 完成。
+ * meta 存在但损坏时明确失败，禁止静默换成默认 tools。
  */
 export class FsConversationStore implements ConversationStore {
   private readonly log: TinyhandsLogger;
@@ -89,8 +114,8 @@ export class FsConversationStore implements ConversationStore {
     this.log = logger.child({ module: "conversation-store" });
   }
 
-  async create(record: ConversationRecord): Promise<void> {
-    const validated = ConversationRecordSchema.parse(record);
+  async create(metadata: ConversationMetadata): Promise<void> {
+    const validated = ConversationMetadataSchema.parse(metadata);
     const dir = this.dirOf(validated.conversationId);
     await mkdir(dir, { recursive: true });
     try {
@@ -100,14 +125,14 @@ export class FsConversationStore implements ConversationStore {
       });
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "EEXIST") {
-        throw new ConversationRecordExistsError(validated.conversationId);
+        throw new ConversationMetadataExistsError(validated.conversationId);
       }
       throw err;
     }
   }
 
   async exists(conversationId: string): Promise<boolean> {
-    if (await this.readRecord(conversationId)) return true;
+    if (await this.readMetadata(conversationId)) return true;
     try {
       await access(this.eventsOf(conversationId));
       return true;
@@ -124,35 +149,35 @@ export class FsConversationStore implements ConversationStore {
 
   async load(
     conversationId: string
-  ): Promise<{ record: ConversationRecord; events: Event[] } | undefined> {
-    const record = await this.readRecord(conversationId);
+  ): Promise<{ metadata: StoredConversationMetadata; events: Event[] } | undefined> {
+    const metadata = await this.readMetadata(conversationId);
     const events = await this.loadEvents(conversationId);
-    if (record) return { record, events };
+    if (metadata) return { metadata, events };
     if (events.length === 0) return undefined;
 
     // 兼容最早期只有 events.jsonl 的数据；tools 缺省沿用旧版 run_bash 默认值。
-    const migrated: ConversationRecord = {
+    const migrated: LegacyConversationMetadata = {
       schemaVersion: 1,
       conversationId,
       createdAt: events[0]?.timestamp ?? 0,
     };
     try {
-      await this.create(migrated);
-      return { record: migrated, events };
+      await this.createLegacyMetadata(migrated);
+      return { metadata: migrated, events };
     } catch (err) {
-      if (!(err instanceof ConversationRecordExistsError)) throw err;
-      const raced = await this.readRecord(conversationId);
+      if (!(err instanceof ConversationMetadataExistsError)) throw err;
+      const raced = await this.readMetadata(conversationId);
       if (!raced) {
         throw new ConversationRecoveryError(
           conversationId,
           "metadata 迁移竞争后仍不可读取"
         );
       }
-      return { record: raced, events };
+      return { metadata: raced, events };
     }
   }
 
-  async list(): Promise<ConversationRecord[]> {
+  async list(): Promise<StoredConversationMetadata[]> {
     let entries: import("node:fs").Dirent[];
     try {
       entries = await readdir(this.workspaceRoot, { withFileTypes: true });
@@ -165,24 +190,29 @@ export class FsConversationStore implements ConversationStore {
       entries
         .filter((entry) => entry.isDirectory())
         .map(async (entry) => {
-          const record = await this.readRecord(entry.name);
-          if (record) return record;
-          return (await this.load(entry.name))?.record;
+          const metadata = await this.readMetadata(entry.name);
+          if (metadata) return metadata;
+          return (await this.load(entry.name))?.metadata;
         })
     );
     return loaded
       .filter(
-        (record): record is ConversationRecord => record !== undefined
+        (metadata): metadata is StoredConversationMetadata => metadata !== undefined
       );
+  }
+
+  async replaceMetadata(metadata: ConversationMetadata): Promise<void> {
+    const validated = ConversationMetadataSchema.parse(metadata);
+    await this.replaceMetadataFile(validated);
   }
 
   async delete(conversationId: string): Promise<void> {
     await rm(this.dirOf(conversationId), { recursive: true, force: true });
   }
 
-  private async readRecord(
+  private async readMetadata(
     conversationId: string
-  ): Promise<ConversationRecord | undefined> {
+  ): Promise<StoredConversationMetadata | undefined> {
     let raw: string;
     try {
       raw = await readFile(this.metaOf(conversationId), "utf8");
@@ -198,7 +228,7 @@ export class FsConversationStore implements ConversationStore {
       throw new ConversationRecoveryError(conversationId, "meta.json 不是合法 JSON");
     }
 
-    const current = ConversationRecordSchema.safeParse(json);
+    const current = ConversationMetadataSchema.safeParse(json);
     if (current.success) {
       if (current.data.conversationId !== conversationId) {
         throw new ConversationRecoveryError(
@@ -209,24 +239,64 @@ export class FsConversationStore implements ConversationStore {
       return current.data;
     }
 
+    const v1 = LegacyConversationMetadataSchema.safeParse(json);
+    if (v1.success) {
+      if (v1.data.conversationId !== conversationId) {
+        throw new ConversationRecoveryError(
+          conversationId,
+          `metadata identity 不匹配：${v1.data.conversationId}`
+        );
+      }
+      return v1.data;
+    }
+
     const legacy = LegacyMetaSchema.safeParse(json);
     if (!legacy.success) {
       throw new ConversationRecoveryError(conversationId, "meta.json 字段不合法");
     }
-    const migrated: ConversationRecord = {
+    const migrated: LegacyConversationMetadata = {
       schemaVersion: 1,
       conversationId,
       createdAt: legacy.data.createdAt,
       ...(legacy.data.tools ? { tools: legacy.data.tools } : {}),
     };
-    await this.replaceRecord(migrated);
+    await this.replaceLegacyMetadata(migrated);
     return migrated;
   }
 
-  private async replaceRecord(record: ConversationRecord): Promise<void> {
-    const target = this.metaOf(record.conversationId);
+  private async createLegacyMetadata(
+    metadata: LegacyConversationMetadata
+  ): Promise<void> {
+    const validated = LegacyConversationMetadataSchema.parse(metadata);
+    const dir = this.dirOf(validated.conversationId);
+    await mkdir(dir, { recursive: true });
+    try {
+      await writeFile(this.metaOf(validated.conversationId), JSON.stringify(validated), {
+        encoding: "utf8",
+        flag: "wx",
+      });
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") {
+        throw new ConversationMetadataExistsError(validated.conversationId);
+      }
+      throw err;
+    }
+  }
+
+  private replaceLegacyMetadata(
+    metadata: LegacyConversationMetadata
+  ): Promise<void> {
+    return this.replaceMetadataFile(
+      LegacyConversationMetadataSchema.parse(metadata)
+    );
+  }
+
+  private async replaceMetadataFile(
+    metadata: StoredConversationMetadata
+  ): Promise<void> {
+    const target = this.metaOf(metadata.conversationId);
     const temporary = `${target}.tmp-${process.pid}-${Date.now()}`;
-    await writeFile(temporary, JSON.stringify(record), "utf8");
+    await writeFile(temporary, JSON.stringify(metadata), "utf8");
     try {
       await rename(temporary, target);
     } catch (err) {

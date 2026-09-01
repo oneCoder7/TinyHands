@@ -1,22 +1,26 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, rmSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import {
   type AgentSession,
-  type SessionFactory,
   ConversationWaitingForInteractionError,
 } from "./agent-session.js";
+import type { AgentSessionFactory } from "./agent-session-factory.js";
 import {
-  ConversationRecordExistsError,
+  ConversationMetadataExistsError,
   type ConversationStore,
 } from "../conversation/conversation-store.js";
 import {
-  findUnmatchedToolCalls,
+  isConversationMetadataCurrent,
+  type ConversationConfig,
+  type ConversationMetadata,
+  type StoredConversationMetadata,
+} from "../conversation/conversation-metadata.js";
+import {
   findHumanInteractionRequest,
   findHumanInteractionResolution,
   findPendingHumanInteraction,
   projectToolPolicyMode,
-  type Event,
   type PublicEventHandler,
   type PublicStreamItem,
 } from "../conversation/events.js";
@@ -115,15 +119,14 @@ export interface ConversationService {
 /**
  * ConversationService —— framework-agnostic 的多会话应用服务。
  *
- * Service 负责应用用例与持久化生命周期，SessionFactory 负责单会话装配；
+ * Service 负责应用用例与持久化生命周期，AgentSessionFactory 负责单会话装配；
  * transport 只能调用 DTO/结果/EventSubscription API，拿不到 AgentSession。
  *
  * 生命周期:
  *  - create:mkdir 专属 workspace + 经工厂装配会话(空事件流,不起 runtime)。id 可
  *    外部指定,不传则生成 UUID。
- *  - resolve:内存命中直接返回;未命中则从 ConversationStore 懒加载恢复(load 历史 →
- *    装配会话 → 按 Event 恢复 ToolCall)。普通历史不触发 runtime；仅存在可安全继续的
- *    continuation 时恢复原 run。
+ *  - resolve:内存命中直接返回;未命中则从 ConversationStore 懒加载历史并装配会话，
+ *    再调用 AgentSession.recover()。Service 不解释 Agent 内部恢复状态机。
  *  - delete:Map 移除 + 关闭公开订阅 + rm -rf workspace(含 events.jsonl)。
  *    协作式止血:abort 让 run 撞检查点终结,但不杀进行中的工具进程。
  *
@@ -135,8 +138,9 @@ export interface ConversationService {
 export class DefaultConversationService implements ConversationService {
   private readonly map = new Map<string, AgentSession>();
   private readonly workspaceRoot: string;
-  private readonly createSession: SessionFactory;
+  private readonly createSession: AgentSessionFactory;
   private readonly store: ConversationStore;
+  private readonly conversationDefaults: ConversationConfig;
   private readonly defaultToolPolicyMode: ToolPolicyMode;
   private readonly log: TinyhandsLogger;
   private readonly subscriptions = new Map<string, Set<EventSubscriptionImpl>>();
@@ -149,14 +153,18 @@ export class DefaultConversationService implements ConversationService {
 
   constructor(opts: {
     workspaceRoot: string;
-    createSession: SessionFactory;
+    createSession: AgentSessionFactory;
     conversationStore: ConversationStore;
+    conversationDefaults: ConversationConfig;
     defaultToolPolicyMode?: ToolPolicyMode;
     logger?: TinyhandsLogger;
   }) {
     this.workspaceRoot = opts.workspaceRoot;
     this.createSession = opts.createSession;
     this.store = opts.conversationStore;
+    this.conversationDefaults = cloneConversationConfig(
+      opts.conversationDefaults
+    );
     validateToolPolicyMode(opts.defaultToolPolicyMode);
     this.defaultToolPolicyMode = opts.defaultToolPolicyMode ?? "default";
     this.log = (opts.logger ?? noopLogger).child({
@@ -185,21 +193,13 @@ export class DefaultConversationService implements ConversationService {
       const workspaceDir = join(this.workspaceRoot, conversationId);
       mkdirSync(workspaceDir, { recursive: true });
 
-      let session: AgentSession;
+      const metadata = this.createMetadata(conversationId, input.tools);
+      let session: AgentSession | undefined;
       try {
+        await this.store.create(metadata);
         session = await this.createSession({
-          conversationId,
+          metadata,
           workspaceDir,
-          tools: input.tools,
-        });
-
-        // metadata 决定 Conversation 是否存在，也决定恢复时的工具配置。写失败不能
-        // 返回成功，否则重启后会话消失或静默换成默认工具集。
-        await this.store.create({
-          schemaVersion: 1,
-          conversationId,
-          createdAt: session.conversationCreatedAt,
-          tools: input.tools,
         });
         await session.conversation.emit({
           type: "tool_policy_mode_changed",
@@ -207,12 +207,25 @@ export class DefaultConversationService implements ConversationService {
           mode: input.toolPolicy?.mode ?? this.defaultToolPolicyMode,
         });
       } catch (err) {
-        if (err instanceof ConversationRecordExistsError) {
+        if (err instanceof ConversationMetadataExistsError) {
           // 排他 create 发现已有 record 时绝不能回滚目录，否则会删除既有会话。
           throw new ConversationExistsError(conversationId);
         }
-        // runtime 尚未惰性启动；清掉本次 create 新建的半成品目录，允许安全重试。
-        rmSync(workspaceDir, { recursive: true, force: true });
+        if (session) {
+          try {
+            await session.close();
+          } catch (closeError) {
+            this.log.error(
+              { conversationId, err: closeError },
+              "创建失败后的 AgentSession 关闭失败，保留 metadata 供恢复"
+            );
+            throw new AggregateError(
+              [err, closeError],
+              "Conversation 创建与回滚均失败"
+            );
+          }
+        }
+        await this.store.delete(conversationId);
         throw err;
       }
 
@@ -227,7 +240,7 @@ export class DefaultConversationService implements ConversationService {
       this.log.info({ conversationId, workspaceDir }, "会话已创建");
       return {
         conversationId,
-        createdAt: session.conversationCreatedAt,
+        createdAt: session.conversation.createdAt,
         running: false,
       };
     });
@@ -348,8 +361,7 @@ export class DefaultConversationService implements ConversationService {
 
   /**
    * 取会话,内存未命中则从磁盘懒加载恢复。恢复 = load 历史 events → 装配会话 →
-   * ToolCall 恢复只读取 Conversation Event：未派发的 continuation 可继续，已派发但
-   * 结果未知的调用只补 error result，绝不重试副作用。普通历史不会启动 runtime。
+   * AgentSession.recover()；普通历史不会启动 runtime。
    *
    * 并发安全:同一 id 的并发 resolve 经 per-ID coordinator 串行，不会重复装配。
    *
@@ -376,100 +388,23 @@ export class DefaultConversationService implements ConversationService {
   private async resumeFromDisk(id: string): Promise<AgentSession | undefined> {
     const persisted = await this.store.load(id);
     if (!persisted) return undefined;
-    const { record, events } = persisted;
+    const { events } = persisted;
+    const metadata = await this.resolveMetadata(persisted.metadata);
 
     const workspaceDir = join(this.workspaceRoot, id);
     // 目录一般还在(崩溃不删目录);兜底重建以防被手动清掉。
     mkdirSync(workspaceDir, { recursive: true });
 
-    // 装配:initialEvents 灌进 EventStream 续接历史;initialRecord 传 tools+createdAt。
+    // 装配：metadata 已完整解析；initialEvents 灌进 EventStream 续接历史。
     const session = await this.createSession({
-      conversationId: id,
+      metadata,
       workspaceDir,
       initialEvents: events,
-      initialRecord: record,
     });
 
-    // 压缩恢复补偿必须先于接受新 run：checkpoint 已提交则补 completed；否则补
-    // process_restarted cancelled。两种修复都只追加事件，不重放摘要请求。
-    await recoverOpenCompactions(session);
-
-    const currentEvents = session.conversation.getEvents();
-    const pending = findPendingHumanInteraction(currentEvents);
-    const protectedRunIds = new Set<string>();
-    if (pending) protectedRunIds.add(pending.continuation.runId);
-
-    // 只有已经派发但没有结果的调用属于副作用未知窗口，绝不自动重试。
-    // 等待审批、已批准未派发都保留原 run，由 Conversation Event 坐标恢复。
-    const orphans = findUnmatchedToolCalls(currentEvents);
-    const dispatched = new Set(
-      currentEvents
-        .filter((event) => event.type === "tool_call_dispatched")
-        .map((event) => event.toolCallId)
-    );
-    const agentMessages = currentEvents.filter(
-      (event): event is Extract<Event, { type: "agent_message" }> =>
-        event.type === "agent_message"
-    );
-    const unsafeMessageCalls = new Set(
-      agentMessages.flatMap((event) => {
-        const callIds = event.toolCalls.map((call) => call.id);
-        return !event.executionTrace || callIds.some((id) => dispatched.has(id))
-          ? callIds
-          : [];
-      })
-    );
-    const unsafe = orphans.filter(
-      (call) => unsafeMessageCalls.has(call.id)
-    );
-    if (unsafe.length > 0) {
-      this.log.warn(
-        { conversationId: id, count: unsafe.length },
-        "恢复发现已派发但结果未知的 tool_call，补偿 error tool_result"
-      );
-      for (const tc of unsafe) {
-        await session.conversation.emit({
-          type: "tool_result",
-          source: "environment",
-          toolCallId: tc.id,
-          content: "进程中断,该工具未完成执行",
-          isError: true,
-        });
-      }
-    }
-
-    const resumableRequest = [...currentEvents]
-      .reverse()
-      .find(
-        (event) =>
-          event.type === "human_interaction_requested" &&
-          !!findHumanInteractionResolution(currentEvents, event.interactionId) &&
-          orphans.some((call) => call.id === event.request.target.toolCallId) &&
-          !dispatched.has(event.request.target.toolCallId)
-      );
-    if (resumableRequest?.type === "human_interaction_requested") {
-      protectedRunIds.add(resumableRequest.continuation.runId);
-    }
-    const resumableAgentMessage = [...agentMessages]
-      .reverse()
-      .find(
-        (event) =>
-          !!event.executionTrace &&
-          event.toolCalls.some((call) =>
-            orphans.some((orphan) => orphan.id === call.id)
-          ) &&
-          event.toolCalls.every((call) => !unsafeMessageCalls.has(call.id)) &&
-          !resumableRequest
-      );
-    if (resumableAgentMessage?.executionTrace) {
-      protectedRunIds.add(resumableAgentMessage.executionTrace.runId);
-    }
-    await session.recoverOpenRuns(protectedRunIds);
-    if (resumableRequest?.type === "human_interaction_requested") {
-      void session.resumeInteraction(resumableRequest);
-    } else if (resumableAgentMessage) {
-      void session.resumeAgentMessage(resumableAgentMessage);
-    }
+    // Agent 内部恢复 facade 负责 Compaction、ToolCall 与 continuation 规则；
+    // Service 不解释 Agent Event 配对，Run Log 也不作为消息恢复来源。
+    await session.recover();
 
     // 日志订阅者(与 create 同款,恢复路径也要挂)。
     session.conversation.subscribe((item) => {
@@ -478,10 +413,42 @@ export class DefaultConversationService implements ConversationService {
     });
 
     this.log.info(
-      { conversationId: id, eventsLoaded: events.length, orphans: orphans.length },
+      { conversationId: id, eventsLoaded: events.length },
       "会话已从磁盘恢复"
     );
     return session;
+  }
+
+  private createMetadata(
+    conversationId: string,
+    tools: readonly string[] | undefined
+  ): ConversationMetadata {
+    return {
+      schemaVersion: 2,
+      conversationId,
+      createdAt: Date.now(),
+      config: {
+        ...cloneConversationConfig(this.conversationDefaults),
+        tools: [...(tools ?? this.conversationDefaults.tools)],
+      },
+    };
+  }
+
+  private async resolveMetadata(
+    stored: StoredConversationMetadata
+  ): Promise<ConversationMetadata> {
+    if (isConversationMetadataCurrent(stored)) return stored;
+    const metadata: ConversationMetadata = {
+      schemaVersion: 2,
+      conversationId: stored.conversationId,
+      createdAt: stored.createdAt,
+      config: {
+        ...cloneConversationConfig(this.conversationDefaults),
+        tools: [...(stored.tools ?? this.conversationDefaults.tools)],
+      },
+    };
+    await this.store.replaceMetadata(metadata);
+    return metadata;
   }
 
   /** 永久删除：关闭观察窗口、停止 resident runtime，再删除持久数据。 */
@@ -550,26 +517,26 @@ export class DefaultConversationService implements ConversationService {
     const conversations: ConversationInfo[] = [];
 
     // 内存活跃会话
-    for (const [conversationId, s] of this.map) {
+    for (const [conversationId, session] of this.map) {
       conversations.push({
         conversationId,
-        createdAt: s.conversationCreatedAt,
-        running: s.running,
+        createdAt: session.conversation.createdAt,
+        running: session.running,
       });
     }
 
     // 磁盘未加载会话(内存未命中的)
     const residentIds = new Set(this.map.keys());
     const inflightIds = new Set(this.loading);
-    const diskRecords = (await this.store.list()).filter(
-      (record) =>
-        !residentIds.has(record.conversationId) &&
-        !inflightIds.has(record.conversationId)
+    const diskMetadata = (await this.store.list()).filter(
+      (metadata) =>
+        !residentIds.has(metadata.conversationId) &&
+        !inflightIds.has(metadata.conversationId)
     );
-    for (const record of diskRecords) {
+    for (const metadata of diskMetadata) {
       conversations.push({
-        conversationId: record.conversationId,
-        createdAt: record.createdAt,
+        conversationId: metadata.conversationId,
+        createdAt: metadata.createdAt,
         running: false, // 不在内存必不在跑
       });
     }
@@ -821,79 +788,13 @@ class EventSubscriptionImpl
   }
 }
 
-async function recoverOpenCompactions(session: AgentSession): Promise<void> {
-  const states = new Map<
-    string,
-    {
-      started: boolean;
-      terminal: boolean;
-      checkpoint?:
-        | Extract<Event, { type: "compacted" }>
-        | (Extract<Event, { type: "compaction_completed" }> & {
-            replacesCompactionSeq?: number;
-            summaryVersion: 1;
-            summary: import("../conversation/events.js").CompactSummary;
-            provider: string;
-            model: string;
-          });
-    }
-  >();
-  for (const event of session.conversation.getEvents()) {
-    if (
-      event.type !== "compaction_started" &&
-      event.type !== "compaction_completed" &&
-      event.type !== "compaction_cancelled" &&
-      event.type !== "compaction_failed" &&
-      event.type !== "compacted"
-    ) {
-      continue;
-    }
-    const state = states.get(event.compactionId) ?? {
-      started: false,
-      terminal: false,
-    };
-    if (event.type === "compaction_started") state.started = true;
-    if (
-      event.type === "compacted" ||
-      (event.type === "compaction_completed" && "summary" in event)
-    ) {
-      state.checkpoint = event;
-    }
-    if (
-      event.type === "compaction_completed" ||
-      event.type === "compaction_cancelled" ||
-      event.type === "compaction_failed"
-    ) {
-      state.terminal = true;
-    }
-    states.set(event.compactionId, state);
-  }
-
-  for (const [compactionId, state] of states) {
-    if (!state.started || state.terminal) continue;
-    if (state.checkpoint) {
-      await session.conversation.emit({
-        type: "compaction_completed",
-        source: "agent",
-        compactionId,
-        throughSeq: state.checkpoint.throughSeq,
-        ...(state.checkpoint.replacesCompactionSeq !== undefined
-          ? { replacesCompactionSeq: state.checkpoint.replacesCompactionSeq }
-          : {}),
-        summaryVersion: state.checkpoint.summaryVersion,
-        summary: state.checkpoint.summary,
-        provider: state.checkpoint.provider,
-        model: state.checkpoint.model,
-        estimatedBeforeTokens: state.checkpoint.estimatedBeforeTokens,
-        estimatedAfterTokens: state.checkpoint.estimatedAfterTokens,
-      });
-    } else {
-      await session.conversation.emit({
-        type: "compaction_cancelled",
-        source: "agent",
-        compactionId,
-        reason: "process_restarted",
-      });
-    }
-  }
+function cloneConversationConfig(
+  config: ConversationConfig
+): ConversationConfig {
+  return {
+    tools: [...config.tools],
+    maxSteps: config.maxSteps,
+    maxModelAttemptsPerStep: config.maxModelAttemptsPerStep,
+    autoCompact: { ...config.autoCompact },
+  };
 }

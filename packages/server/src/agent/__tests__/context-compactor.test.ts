@@ -1,6 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
-import { ContextCompactor, findSafeCompactionBoundaries } from "../context-compactor.js";
-import { Conversation } from "../../conversation/conversation.js";
+import { ContextCompactor, findSafeCompactionBoundaries } from "../context/context-compactor.js";
+import { createTestConversation } from "../../conversation/__tests__/conversation-fixture.js";
 import type { Event } from "../../conversation/events.js";
 import type { LLMClient } from "../../llm/llm-client.js";
 import type { LLMResponse } from "../../llm/types.js";
@@ -57,7 +57,7 @@ async function harness(
     identity: { provider: "test", model: "model", apiMode: "messages" },
     chat,
   };
-  const conversation = new Conversation("c1");
+  const conversation = createTestConversation("c1");
   return {
     store,
     journal,
@@ -82,7 +82,7 @@ describe("ContextCompactor", () => {
       { runId: "run-1", step: 0 }
     );
 
-    expect(prepared.compacted).toBe(false);
+    expect(prepared.messages).toContainEqual({ role: "user", text: "short" });
     expect(h.llm.chat).not.toHaveBeenCalled();
     expect(h.conversation.getEvents().map((event) => event.type)).toEqual([
       "user_message",
@@ -114,7 +114,6 @@ describe("ContextCompactor", () => {
       { runId: "run-1", step: 0 }
     );
 
-    expect(prepared.compacted).toBe(true);
     expect(prepared.messages).toContainEqual({ role: "user", text: "latest query" });
     expect(prepared.systemContext[0]).toContain('"objective":"keep working"');
     const events = h.conversation.getEvents();
@@ -182,7 +181,6 @@ describe("ContextCompactor", () => {
       { runId: "run-context", step: 0 }
     );
 
-    expect(prepared.compacted).toBe(true);
     expect(prepared.messages.at(-1)).toEqual({
       role: "user",
       text: "one-shot-reminder",

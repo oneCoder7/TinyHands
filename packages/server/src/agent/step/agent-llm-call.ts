@@ -1,12 +1,16 @@
 import { randomUUID } from "node:crypto";
-import type { LLMClient } from "../llm/llm-client.js";
+import type { LLMClient } from "../../llm/llm-client.js";
 import type {
   Delta,
   LLMResponse,
   Message,
-} from "../llm/types.js";
-import type { RunJournal } from "../observability/run-log.js";
-import type { Tool } from "../tools/tool.js";
+} from "../../llm/types.js";
+import type { RunJournal } from "../../observability/run-log.js";
+import type { Tool } from "../../tools/tool.js";
+import {
+  normalizeLLMRequestError,
+  type LLMRequestError,
+} from "../../llm/llm-request-error.js";
 
 export interface AgentLLMCallInput {
   runId: string;
@@ -30,9 +34,9 @@ export type AgentLLMCallOutcome =
       llmCallId: string;
     }
   | {
-      type: "provider_error";
+      type: "failed";
       llmCallId: string;
-      error: unknown;
+      error: LLMRequestError;
     };
 
 /** 记录并执行一次正常 Agent LLM 调用，不提交 Conversation 业务事件。 */
@@ -76,7 +80,11 @@ export class AgentLLMCall {
         ...this.llm.identity,
       });
       if (aborted) return { type: "aborted", llmCallId };
-      return { type: "provider_error", llmCallId, error };
+      return {
+        type: "failed",
+        llmCallId,
+        error: normalizeLLMRequestError(error),
+      };
     }
 
     await this.journal.append({

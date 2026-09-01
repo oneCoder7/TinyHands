@@ -1,12 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import { z } from "zod/v4";
-import { Conversation } from "../../conversation/conversation.js";
+import { createTestConversation } from "../../conversation/__tests__/conversation-fixture.js";
 import type { RunLogRecord } from "../../observability/run-log.js";
 import { RunJournal } from "../../observability/run-log.js";
 import type { RunLogStore } from "../../observability/run-log-store.js";
 import { HumanInteractionCoordinator } from "../../server/human-interaction.js";
 import { ToolRegistry, type Tool } from "../../tools/tool.js";
-import { ToolCallExecutor } from "../tool-call-executor.js";
+import { ToolCallExecutor } from "../step/tool-call/tool-call-executor.js";
+import { ToolCallHandler } from "../step/tool-call/tool-call-handler.js";
 
 class MemoryRunLogStore implements RunLogStore {
   records: RunLogRecord[] = [];
@@ -17,9 +18,9 @@ class MemoryRunLogStore implements RunLogStore {
   async remove() {}
 }
 
-describe("ToolCallExecutor approval", () => {
+describe("ToolCallHandler approval", () => {
   it("approve 是匹配调用的一次性授权，复检仍为 ask 时可以派发", async () => {
-    const conversation = new Conversation("c1");
+    const conversation = createTestConversation("c1");
     const trace = {
       runId: "r1",
       step: 0,
@@ -63,17 +64,18 @@ describe("ToolCallExecutor approval", () => {
     };
     const store = new MemoryRunLogStore();
     const journal = await RunJournal.open("c1", store);
-    const executor = new ToolCallExecutor(
-      new ToolRegistry().register(tool),
+    const executor = new ToolCallExecutor(new ToolRegistry().register(tool), {
+      runtime: {} as never,
+    });
+    const handler = new ToolCallHandler(
+      conversation,
+      executor,
       journal,
       interactions
     );
-    await expect(executor.executeCalls(
-      conversation,
-      [call],
-      { runtime: {} as never },
-      trace
-    )).resolves.toEqual({ type: "completed" });
+    await expect(handler.handleCalls({ calls: [call], trace })).resolves.toMatchObject({
+      type: "completed",
+    });
 
     expect(execute).toHaveBeenCalledOnce();
     expect(conversation.getEvents().slice(-2).map((event) => event.type)).toEqual([

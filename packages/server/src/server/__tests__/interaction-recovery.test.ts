@@ -5,7 +5,8 @@ import { describe, expect, it, vi } from "vitest";
 import { FsConversationStore } from "../../conversation/conversation-store.js";
 import type { LLMClient } from "../../llm/llm-client.js";
 import { FsRunLogStore } from "../../observability/run-log-store.js";
-import { makeAgentSessionFactory } from "../agent-session.js";
+import { makeAgentSessionFactory } from "../agent-session-factory.js";
+import { TEST_CONVERSATION_DEFAULTS } from "../../conversation/__tests__/conversation-fixture.js";
 import { DefaultConversationService } from "../conversation-service.js";
 
 describe("Human Interaction recovery", () => {
@@ -40,9 +41,12 @@ describe("Human Interaction recovery", () => {
     const makeService = () => new DefaultConversationService({
       workspaceRoot: root,
       conversationStore,
+      conversationDefaults: {
+        ...TEST_CONVERSATION_DEFAULTS,
+        maxSteps: 3,
+      },
       createSession: makeAgentSessionFactory({
         llm,
-        maxStep: 3,
         runtime: { type: "local" },
         conversationStore,
         runLogStore,

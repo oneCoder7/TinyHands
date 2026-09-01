@@ -1,15 +1,11 @@
 import type { TinyhandsLogger } from "../logging/logger.js";
 import type { ToolPolicyConfig } from "../tools/tool-policy.js";
+import type { AutoCompactConfig } from "../conversation/conversation-metadata.js";
+
+export type { AutoCompactConfig } from "../conversation/conversation-metadata.js";
 
 export type LLMProvider = "anthropic" | "openai";
 export type OpenAIApiMode = "responses" | "chat_completions";
-
-export interface AutoCompactConfig {
-  enabled: boolean;
-  contextWindow: number;
-  triggerRatio: number;
-  targetRatio: number;
-}
 
 interface SharedLLMConfig {
   provider: LLMProvider;

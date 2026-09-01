@@ -7,11 +7,15 @@ import type { LLMClient } from "../../llm/llm-client.js";
 import type { LLMResponse } from "../../llm/types.js";
 import { FsRunLogStore } from "../../observability/run-log-store.js";
 import { Conversation } from "../../conversation/conversation.js";
+import {
+  createTestConversation,
+  testConversationMetadata,
+} from "../../conversation/__tests__/conversation-fixture.js";
 import type { Runtime } from "../../runtime/runtime.js";
 import {
   AgentSession,
-  makeAgentSessionFactory,
 } from "../agent-session.js";
+import { makeAgentSessionFactory } from "../agent-session-factory.js";
 import { HumanInteractionCoordinator } from "../human-interaction.js";
 
 describe("AgentSession 执行关联", () => {
@@ -35,15 +39,14 @@ describe("AgentSession 执行关联", () => {
       }
     );
     const session = new AgentSession({
-      conversationId: "owned",
-      conversation: new Conversation("owned"),
+      conversation: createTestConversation("owned"),
       runtime,
       agent: { run } as never,
+      recovery: { recover: vi.fn(async () => undefined) } as never,
       journal: {
         append: vi.fn(async () => {}),
         recoverOpenRuns: vi.fn(async () => {}),
       } as never,
-      conversationCreatedAt: Date.now(),
     });
 
     expect("runtime" in session.conversation).toBe(false);
@@ -78,15 +81,13 @@ describe("AgentSession 执行关联", () => {
     };
     const createSession = makeAgentSessionFactory({
       llm,
-      maxStep: 2,
       runtime: { type: "local" },
       conversationStore,
       runLogStore,
     });
     const session = await createSession({
-      conversationId: "c1",
+      metadata: testConversationMetadata("c1", { tools: [], maxSteps: 2 }),
       workspaceDir: join(root, "c1"),
-      tools: [],
     });
 
     const submitted = await session.submit("hello");
@@ -156,15 +157,13 @@ describe("AgentSession 执行关联", () => {
     };
     const createSession = makeAgentSessionFactory({
       llm,
-      maxStep: 2,
       runtime: { type: "local" },
       conversationStore,
       runLogStore,
     });
     const session = await createSession({
-      conversationId: "c2",
+      metadata: testConversationMetadata("c2", { tools: [], maxSteps: 2 }),
       workspaceDir: join(root, "c2"),
-      tools: [],
     });
 
     await session.submit("first");
@@ -222,15 +221,16 @@ describe("AgentSession 执行关联", () => {
         identity: { provider: "test", model: "model", apiMode: "messages" },
         chat,
       },
-      maxStep: 3,
       runtime: { type: "local" },
       conversationStore,
       runLogStore,
     });
     const session = await createSession({
-      conversationId: "approval",
+      metadata: testConversationMetadata("approval", {
+        tools: [],
+        maxSteps: 3,
+      }),
       workspaceDir: join(root, "approval"),
-      tools: [],
     });
     await session.conversation.emit({
       type: "tool_policy_mode_changed",

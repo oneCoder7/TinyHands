@@ -13,7 +13,7 @@ import {
   calculateCompactionBudget,
   ContextCompactor,
   estimateCanonicalInputTokens,
-} from "../packages/server/src/agent/context-compactor.js";
+} from "../packages/server/src/agent/context/context-compactor.js";
 import { Conversation } from "../packages/server/src/conversation/conversation.js";
 import { FsConversationStore } from "../packages/server/src/conversation/conversation-store.js";
 import {
@@ -76,7 +76,22 @@ async function main(): Promise<void> {
     const runLogStore = new FsRunLogStore(workspaceRoot);
     const journal = await RunJournal.open(conversationId, runLogStore);
     const llm = createLLMClient(config.llm);
-    const conversation = new Conversation(conversationId, {
+    const metadata = {
+      schemaVersion: 2 as const,
+      conversationId,
+      createdAt: Date.now(),
+      config: {
+        tools: [],
+        maxSteps: config.maxStep,
+        maxModelAttemptsPerStep: 1,
+        autoCompact: {
+          ...config.llm.autoCompact,
+          maxOutputTokens: config.llm.maxTokens,
+        },
+      },
+    };
+    await conversationStore.create(metadata);
+    const conversation = new Conversation(metadata, {
       store: conversationStore,
     });
     await seedHistory(conversation);
@@ -162,7 +177,6 @@ async function main(): Promise<void> {
       runId: "compact-run-retry",
       step: 0,
     });
-    invariant(prepared.compacted, "新 query 到达后没有重新触发压缩");
     invariant(prepared.systemContext.length === 1, "压缩摘要没有进入 systemContext");
     invariant(
       prepared.messages.some(
@@ -205,7 +219,7 @@ async function main(): Promise<void> {
 
     // 磁盘恢复后继续应用 checkpoint，Public View 仍隐藏内部摘要。
     const loaded = (await conversationStore.load(conversationId))?.events ?? [];
-    const resumed = new Conversation(conversationId, {
+    const resumed = new Conversation(metadata, {
       store: conversationStore,
       initialEvents: loaded,
     });

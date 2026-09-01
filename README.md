@@ -229,6 +229,16 @@ Content-Type: application/json
   Conversation 恢复来源。
 - 删除会话时会删除整个会话目录。
 
+Agent 内核采用固定执行骨架与职责明确的内部组件：`Agent` 只负责 Run 循环，
+`AgentStepExecutor` 负责 Step 提交顺序；`CompletionHandler` 处理 finish 完成协议，
+`ToolCallHandler` 处理策略、approval、事件和恢复配对，而 `ToolCallExecutor` 只做参数
+校验与 Tool 执行。模型请求异常由 provider adapter 归一为 `LLMRequestError`，每次失败
+都经过 `AgentErrorHandler`，达到重试上限时也不会把 provider 原始异常暴露到公共事件。
+
+Conversation 的身份与 effective config 固化在 `meta.json` 的 `ConversationMetadata`；
+`AgentSession` 只是当前进程中单个 Conversation 的执行控制器。恢复规则集中在
+`AgentRecovery`，`ConversationService` 不解释 Agent 内部 ToolCall 或 Compaction 状态机。
+
 Tinyhands 当前不提供 `/stats`、`/metrics` 或 Run Log 查询 API；需要回溯时直接消费
 持久化 JSONL，后续应根据真实查询需求再设计 read model。
 

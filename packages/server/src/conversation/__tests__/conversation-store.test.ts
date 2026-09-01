@@ -4,10 +4,11 @@ import { appendFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  ConversationRecordExistsError,
+  ConversationMetadataExistsError,
   ConversationRecoveryError,
   FsConversationStore,
 } from "../conversation-store.js";
+import { testConversationMetadata } from "./conversation-fixture.js";
 import type { Event } from "../events.js";
 
 /**
@@ -153,28 +154,24 @@ describe("FsConversationStore", () => {
     await expect(store.delete("never-existed")).resolves.toBeUndefined();
   });
 
-  it("create → load 往返 schema record", async () => {
+  it("create → load 往返 schema metadata", async () => {
     const id = "conv-meta";
-    const record = {
-      schemaVersion: 1 as const,
-      conversationId: id,
+    const metadata = {
+      ...testConversationMetadata(id, {
+        tools: ["run_bash", "run_code"],
+      }),
       createdAt: 1700000000000,
-      tools: ["run_bash", "run_code"],
     };
-    await store.create(record);
+    await store.create(metadata);
 
-    expect((await store.load(id))?.record).toEqual(record);
+    expect((await store.load(id))?.metadata).toEqual(metadata);
   });
 
-  it("create 使用排他语义，同一 record 不能覆盖", async () => {
-    const record = {
-      schemaVersion: 1 as const,
-      conversationId: "same",
-      createdAt: 1,
-    };
-    await store.create(record);
-    await expect(store.create(record)).rejects.toBeInstanceOf(
-      ConversationRecordExistsError
+  it("create 使用排他语义，同一 metadata 不能覆盖", async () => {
+    const metadata = testConversationMetadata("same");
+    await store.create(metadata);
+    await expect(store.create(metadata)).rejects.toBeInstanceOf(
+      ConversationMetadataExistsError
     );
   });
 
@@ -193,7 +190,7 @@ describe("FsConversationStore", () => {
       JSON.stringify({ createdAt: 123, tools: ["run_bash"] })
     );
 
-    expect((await store.load(id))?.record).toEqual({
+    expect((await store.load(id))?.metadata).toEqual({
       schemaVersion: 1,
       conversationId: id,
       createdAt: 123,

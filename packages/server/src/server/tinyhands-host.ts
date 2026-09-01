@@ -1,7 +1,7 @@
 import { FsConversationStore } from "../conversation/conversation-store.js";
 import { createLLMClient } from "../llm/factory.js";
 import { FsRunLogStore } from "../observability/run-log-store.js";
-import { makeAgentSessionFactory } from "./agent-session.js";
+import { makeAgentSessionFactory } from "./agent-session-factory.js";
 import {
   DefaultConversationService,
   type ConversationService,
@@ -62,16 +62,11 @@ export async function createTinyhandsHost(
   const runLogStore = new FsRunLogStore(config.workspaceRoot, logger);
   const createSession = makeAgentSessionFactory({
     llm,
-    maxStep: config.maxStep,
     runtime: config.runtime,
     dockerInstanceScope,
     logger,
     conversationStore,
     runLogStore,
-    autoCompact: {
-      config: config.llm.autoCompact,
-      maxOutputTokens: config.llm.maxTokens,
-    },
     toolPolicyGetter: config.toolPolicy?.getter,
   });
 
@@ -79,6 +74,15 @@ export async function createTinyhandsHost(
       workspaceRoot: config.workspaceRoot,
       createSession,
       conversationStore,
+      conversationDefaults: {
+        tools: ["run_bash"],
+        maxSteps: config.maxStep,
+        maxModelAttemptsPerStep: 1,
+        autoCompact: {
+          ...config.llm.autoCompact,
+          maxOutputTokens: config.llm.maxTokens,
+        },
+      },
       defaultToolPolicyMode: config.toolPolicy?.defaultMode ?? "default",
       logger,
     });

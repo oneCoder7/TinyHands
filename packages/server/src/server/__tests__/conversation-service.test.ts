@@ -7,18 +7,26 @@ import {
 } from "../conversation-service.js";
 import {
   AgentSession,
-  makeAgentSessionFactory,
-  type SessionFactory,
 } from "../agent-session.js";
+import {
+  makeAgentSessionFactory,
+  type AgentSessionFactory,
+} from "../agent-session-factory.js";
 import { FsConversationStore } from "../../conversation/conversation-store.js";
 import { Conversation } from "../../conversation/conversation.js";
 import { findUnmatchedToolCalls } from "../../conversation/events.js";
 import type { Event } from "../../conversation/events.js";
 import type { ToolCall } from "../../llm/types.js";
 import type { Runtime } from "../../runtime/runtime.js";
+import { AgentRecovery } from "../../agent/agent-recovery.js";
+import { CompactionRecovery } from "../../agent/context/compaction-recovery.js";
 import type { LLMClient } from "../../llm/llm-client.js";
 import type { LLMResponse } from "../../llm/types.js";
 import { FsRunLogStore } from "../../observability/run-log-store.js";
+import {
+  TEST_CONVERSATION_DEFAULTS,
+  testConversationMetadata,
+} from "../../conversation/__tests__/conversation-fixture.js";
 import { mkdtempSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -48,12 +56,12 @@ function makeRealFactory(conversationStore: FsConversationStore) {
   const killCalls = new Map<string, number>();
   const sessions = new Map<string, AgentSession>();
   let factoryCalls = 0;
-  const factory: SessionFactory = async ({
-    conversationId,
+  const factory: AgentSessionFactory = async ({
+    metadata,
     workspaceDir,
     initialEvents,
-    initialRecord,
   }) => {
+    const conversationId = metadata.conversationId;
     factoryCalls++;
     createCalls.set(conversationId, 0);
     killCalls.set(conversationId, 0);
@@ -71,17 +79,35 @@ function makeRealFactory(conversationStore: FsConversationStore) {
         );
       },
     } as unknown as Runtime;
-    const conversation = new Conversation(conversationId, {
+    const conversation = new Conversation(metadata, {
       store: conversationStore,
       initialEvents,
     });
+    const journal = { recoverOpenRuns: async () => {} } as never;
+    const recovery = new AgentRecovery(
+      conversation,
+      journal,
+      {
+        closePendingCalls: async (calls: readonly ToolCall[]) => {
+          for (const call of calls) {
+            await conversation.emit({
+              type: "tool_result",
+              source: "environment",
+              toolCallId: call.id,
+              content: "进程中断,该工具未完成执行",
+              isError: true,
+            });
+          }
+        },
+      } as never,
+      new CompactionRecovery(conversation)
+    );
     const session = new AgentSession({
-      conversationId,
       conversation,
       agent: {} as never,
-      journal: { recoverOpenRuns: async () => {} } as never,
+      recovery,
+      journal,
       runtime,
-      conversationCreatedAt: initialRecord?.createdAt ?? Date.now(),
     });
     sessions.set(conversationId, session);
     return session;
@@ -104,6 +130,7 @@ function newManager(workspaceRoot: string) {
     workspaceRoot,
     createSession: factory,
     conversationStore,
+    conversationDefaults: TEST_CONVERSATION_DEFAULTS,
   });
   const manager = testFacade(service, sessions);
   return {
@@ -170,9 +197,8 @@ describe("ConversationService 持久化与恢复", () => {
   it("create 后不发消息,不触发 runtime.create(§6 验收6)", async () => {
     const root = tmpRoot();
     const { manager, createCalls } = newManager(root);
-    const session = await manager.create("c1");
+    await manager.create("c1");
     expect(createCalls.get("c1")).toBe(0);
-    expect(session.runtimeStarted).toBe(false);
   });
 
   it("崩溃→重启→getOrResume 拿回完整历史并续号(§6 验收1)", async () => {
@@ -280,7 +306,7 @@ describe("ConversationService 持久化与恢复", () => {
     // manager 不认识 driveRun(那是 submitUserMessage 的职责);getOrResume 只装配,
     // 从不触发 run。故恢复后 running=false、runtime 未起 → 物理上无法续跑。
     expect(s2!.running).toBe(false);
-    expect(s2!.runtimeStarted).toBe(false);
+    expect(m2.createCalls.get("c1")).toBe(0);
   });
 
   it("destroy 删 events.jsonl + workspace,不可恢复(§6 验收9)", async () => {
@@ -518,7 +544,7 @@ describe("ConversationService 持久化与恢复", () => {
     const base = makeRealFactory(conversationStore);
     const resumeStarted = deferred();
     const allowResume = deferred();
-    const delayedFactory: SessionFactory = async (opts) => {
+    const delayedFactory: AgentSessionFactory = async (opts) => {
       if (opts.initialEvents) {
         resumeStarted.resolve();
         await allowResume.promise;
@@ -529,6 +555,7 @@ describe("ConversationService 持久化与恢复", () => {
       workspaceRoot: root,
       createSession: delayedFactory,
       conversationStore,
+      conversationDefaults: TEST_CONVERSATION_DEFAULTS,
     });
     const manager = testFacade(service, base.sessions);
 
@@ -571,7 +598,6 @@ describe("ConversationService 持久化与恢复", () => {
         identity: { provider: "test", model: "model", apiMode: "messages" },
         chat,
       },
-      maxStep: 2,
       runtime: { type: "local" },
       conversationStore,
       runLogStore: new FsRunLogStore(root),
@@ -580,6 +606,11 @@ describe("ConversationService 持久化与恢复", () => {
       workspaceRoot: root,
       createSession,
       conversationStore,
+      conversationDefaults: {
+        ...TEST_CONVERSATION_DEFAULTS,
+        tools: [],
+        maxSteps: 2,
+      },
     });
     await service.create({ conversationId: "c1", tools: [] });
     await service.send("c1", "hello");

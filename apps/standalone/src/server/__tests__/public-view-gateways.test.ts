@@ -16,6 +16,10 @@ import { DefaultConversationService } from "../../../../../packages/server/src/s
 import { registerSseGateway } from "../sse-gateway.js";
 import { registerWsGateway } from "../ws-gateway.js";
 import { AgentSession } from "../../../../../packages/server/src/server/agent-session.js";
+import {
+  createTestConversation,
+  TEST_CONVERSATION_DEFAULTS,
+} from "../../../../../packages/server/src/conversation/__tests__/conversation-fixture.js";
 
 const apps: Array<ReturnType<typeof Fastify>> = [];
 
@@ -50,13 +54,13 @@ async function serviceFor(conversation: Conversation): Promise<ConversationServi
   const service = new DefaultConversationService({
     workspaceRoot,
     conversationStore,
-    createSession: async ({ conversationId }) => new AgentSession({
-      conversationId,
+    conversationDefaults: TEST_CONVERSATION_DEFAULTS,
+    createSession: async () => new AgentSession({
       conversation,
       agent: {} as never,
+      recovery: { recover: async () => undefined } as never,
       journal: { recoverOpenRuns: async () => {} } as never,
       runtime: { start: async () => {}, close: async () => {} } as Runtime,
-      conversationCreatedAt: Date.now(),
     }),
   });
   await service.create({ conversationId: conversation.id });
@@ -98,7 +102,7 @@ function address(app: ReturnType<typeof Fastify>): { host: string; port: number 
 
 describe("WS/SSE Public Event View", () => {
   it("WS 首连历史与实时事件都不包含 providerReplay", async () => {
-    const conversation = new Conversation("c1");
+    const conversation = createTestConversation("c1");
     await emitCheckpoint(conversation, "historical-cmp");
     await conversation.emit({
       type: "agent_message",
@@ -139,7 +143,7 @@ describe("WS/SSE Public Event View", () => {
   });
 
   it("SSE 首连历史不包含 providerReplay", async () => {
-    const conversation = new Conversation("c1");
+    const conversation = createTestConversation("c1");
     await emitCheckpoint(conversation, "sse-cmp");
     await conversation.emit({
       type: "agent_message",
@@ -163,7 +167,7 @@ describe("WS/SSE Public Event View", () => {
   });
 
   it("删除会话时 WS 根据 subscription closeReason 保持 4410 语义", async () => {
-    const conversation = new Conversation("c1");
+    const conversation = createTestConversation("c1");
     const service = await serviceFor(conversation);
     const app = Fastify();
     apps.push(app);
@@ -182,7 +186,7 @@ describe("WS/SSE Public Event View", () => {
   });
 
   it("删除会话时 SSE 根据 subscription closeReason 发送 legacy 错误并结束", async () => {
-    const conversation = new Conversation("c1");
+    const conversation = createTestConversation("c1");
     const service = await serviceFor(conversation);
     const app = Fastify();
     apps.push(app);

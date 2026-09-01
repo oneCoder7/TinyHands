@@ -13,6 +13,7 @@ import {
   toOpenAIResponseInput,
   toOpenAIResponseTools,
 } from "./openai-mappers.js";
+import { normalizeLLMRequestError } from "./llm-request-error.js";
 
 type ResponsesParams = Omit<ResponseCreateParamsNonStreaming, "stream">;
 
@@ -54,6 +55,19 @@ export class OpenAIResponsesClient implements LLMClient {
     messages: Message[],
     tools: Tool[],
     opts: ChatOptions = {}
+  ): Promise<LLMResponse> {
+    try {
+      return await this.request(messages, tools, opts);
+    } catch (error) {
+      if (opts.signal?.aborted) throw error;
+      throw normalizeLLMRequestError(error);
+    }
+  }
+
+  private async request(
+    messages: Message[],
+    tools: Tool[],
+    opts: ChatOptions
   ): Promise<LLMResponse> {
     const instructions = joinSystemContext(opts.systemContext);
     const params: ResponsesParams = {
