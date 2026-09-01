@@ -44,7 +44,7 @@ export class OpenSandboxRuntime implements Runtime {
     this.log = (opts.logger ?? noopLogger).child({ module: "opensandbox-runtime" });
   }
 
-  async create(): Promise<void> {
+  async start(): Promise<void> {
     this.log.info(
       { serverUrl: this.serverUrl, image: this.image },
       "正在创建 OpenSandbox 沙箱"
@@ -179,7 +179,7 @@ const { chromium } = require('playwright');
   }
 
   /** 终止沙箱(幂等)。 */
-  async kill(): Promise<void> {
+  async close(): Promise<void> {
     if (this.killed) return;
     this.killed = true;
 

@@ -25,6 +25,8 @@ registry；当前可在本 workspace 或通过 `npm pack` 产物集成，禁止�
 - **持久化执行追踪**——每次 HTTP trigger、Agent run、LLM 调用和 Tool 执行通过稳定 ID 关联,可在进程重启后回溯。
 - **协作式打断**——运行中随时可打断,agent 在检查点干净地停下,不留半截状态。
 - **自动上下文压缩**——默认按 20k 上下文窗口自动生成可恢复 checkpoint，原始事件永不删除。
+- **会话级工具权限**——内置 `request_approval` / `default` / `full_access` 三种模式，并支持 Host 业务策略覆盖。
+- **持久化人工审批**——高风险工具在执行前暂停原 run，批准或拒绝后从原 step 继续，重启不会丢失待处理请求。
 - **流式输出**——支持 token 级流式,包括 extended thinking 的思考过程实时呈现。
 
 ## 快速开始
@@ -45,7 +47,7 @@ npm run serve        # 默认监听 :8787
 # 1) 创建会话,启用 shell 和代码执行工具
 curl -XPOST localhost:8787/v1/conversations \
   -H 'content-type: application/json' \
-  -d '{"conversationId":"demo","tools":["run_bash","run_code"]}'
+  -d '{"conversationId":"demo","tools":["run_bash","run_code"],"toolPolicy":{"mode":"full_access"}}'
 
 # 2) 订阅它的事件流(另开一个终端,保持连接)
 curl -N localhost:8787/v1/conversations/demo/events
@@ -104,6 +106,11 @@ const host = await createTinyhandsHost({
     },
   },
   runtime: { type: "local" },
+  toolPolicy: {
+    defaultMode: "default",
+    getter: async (query) =>
+      query.toolName === "read_file" ? { type: "allow" } : undefined,
+  },
 });
 
 // 直接调用应用端口
@@ -125,7 +132,8 @@ await host.close();
 ### 1. 创建会话
 
 `POST /v1/conversations`,可选传 `conversationId`(不传则自动生成)和
-`tools`(要启用的可选工具)。每个会话对应一个独立的工作目录和执行环境。
+`tools`(要启用的可选工具)以及 `toolPolicy: { mode }`。未传 mode 时复制 Host 的
+`defaultMode`（默认 `default`）并立即持久化；此后该会话与 Host 默认值解耦。
 
 ### 2. 订阅事件流
 
@@ -141,19 +149,24 @@ await host.close();
 | 事件类型            | 含义                                        |
 | ------------------- | ------------------------------------------- |
 | `user_message`      | 用户消息(发出的消息会回显给所有订阅者)    |
-| `thinking_finished` | 一段思考定稿(extended thinking)           |
+| `thinking_completed` | 一段思考定稿(extended thinking)          |
 | `agent_message`     | agent 的发言 + 它发起的工具调用             |
 | `tool_result`       | 某次工具调用的执行结果                      |
-| `finished`          | 任务完成(agent 调用了 `finish`)          |
+| `agent_completed`   | 任务完成(agent 调用了 `finish`)             |
 | `interrupted`       | 本轮 run 被打断                             |
 | `error`             | 运行出错                                    |
+| `tool_policy_mode_changed` | 会话工具权限模式已初始化或切换       |
+| `human_interaction_requested` | Agent 等待人工交互；当前类型为 `approval` |
+| `human_interaction_resolved` | 人工交互已批准、拒绝或因 interrupt 取消 |
 | `compaction_started` | 上下文压缩开始，可通过 interrupt 中断       |
 | `compaction_completed` | 上下文压缩 checkpoint 已提交              |
 | `compaction_cancelled` | 上下文压缩被用户中断或进程重启取消         |
 | `compaction_failed` | 上下文压缩失败，只包含稳定错误码             |
 
 外加瞬态的 `delta`(流式 token / 思考增量),只广播、不入历史。
-内部 `compacted` checkpoint 会持久化，但不会通过 WS/SSE 暴露。
+内部 `context_message`、`tool_call_dispatched` 以及恢复坐标会持久化，但不会通过
+SSE/SDK 暴露。压缩摘要存放在 `compaction_completed` 的私有字段中，公开视图只返回
+稳定的完成元数据。
 
 ### 3. 发消息 / 打断
 
@@ -176,7 +189,28 @@ await host.close();
 
 完整接口见 [HTTP API](#http-api)。
 
-### 4. 持久化数据
+### 4. 工具权限与人工审批
+
+`default` 直接允许 `read_file`，其他受控工具请求审批；`request_approval` 对所有
+受控工具请求审批；`full_access` 直接允许。`finish` 是 Loop 完成协议，不经过 Tool
+Policy。Host 的 `toolPolicy.getter` 优先于 mode，返回 `undefined` 时才回退到 mode；
+getter 异常或返回非法值会 fail closed，只拒绝当前调用。
+
+等待时会收到 `human_interaction_requested`，发送新用户消息返回
+`409 conversation_waiting_for_interaction`。通过以下接口批准或拒绝：
+
+```http
+POST /v1/conversations/:conversationId/interactions/:interactionId/respond
+Content-Type: application/json
+
+{"interactionType":"approval","response":{"decision":"approve"}}
+```
+
+拒绝会写入与原调用同 `toolCallId` 的 error `tool_result`，随后继续同轮剩余调用。
+相同响应可幂等重试，不同响应返回 `409 interaction_conflict`。切换策略不会自动解决
+已有请求。
+
+### 5. 持久化数据
 
 每个会话的数据默认保存在 `~/workspace/<conversationId>/`；开发和测试可用
 `TINYHANDS_HOME` 覆盖 `~`：
@@ -191,6 +225,8 @@ await host.close();
 - `events.jsonl` 是对话真相源，保存用户消息、Agent/Tool 结果和压缩 checkpoint。
 - `run_log.jsonl` 保存 run、step、LLM、Tool 的生命周期、耗时和 provider 上报的
   token usage，但不重复保存 prompt、回复、工具参数或工具结果正文。
+- Message、审批状态和工具配对只从 `events.jsonl` 恢复；Run Log 绝不作为
+  Conversation 恢复来源。
 - 删除会话时会删除整个会话目录。
 
 Tinyhands 当前不提供 `/stats`、`/metrics` 或 Run Log 查询 API；需要回溯时直接消费
@@ -234,7 +270,7 @@ export const myTool: Tool<MyArgs> = {
 ```
 
 **换一种执行环境。** 实现 `Runtime` 接口(`exec` / `readFile` / `writeFile` /
-`runCode` / `runBrowser` + `create`/`kill` 生命周期),即可接入任意沙箱后端。
+`runCode` / `runBrowser` + `start`/`close` 生命周期),即可接入任意沙箱后端。
 内置 `Local` / `Docker` / `OpenSandbox` 三种可直接参考。
 
 **接一个新的 LLM provider。** 实现 `LLMClient` 接口(核心就一个 `chat` 方法,
@@ -261,6 +297,8 @@ export const myTool: Tool<MyArgs> = {
 | DELETE | `/v1/conversations/:conversationId`            | 删除会话            |
 | POST   | `/v1/conversations/:conversationId/messages`   | 提交一条用户消息    |
 | POST   | `/v1/conversations/:conversationId/interrupt`  | 协作式打断 run      |
+| PUT    | `/v1/conversations/:conversationId/tool-policy` | 切换会话权限模式   |
+| POST   | `/v1/conversations/:conversationId/interactions/:interactionId/respond` | 响应人工交互 |
 | GET    | `/v1/conversations/:conversationId/events`     | SSE 下行事件流      |
 
 `/v1` 的错误体为 `{ "error": { "code", "message" } }`。SSE 支持

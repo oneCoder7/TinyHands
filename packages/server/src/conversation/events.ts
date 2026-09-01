@@ -15,6 +15,7 @@ import type {
   PublicStreamItem as ProtocolPublicStreamItem,
   ThinkingBlock,
   ToolCall,
+  ToolPolicyMode,
 } from "@tinyhands/protocol";
 export type { CompactionFailureCode, Delta } from "@tinyhands/protocol";
 import type { EventAppender } from "./conversation-store.js";
@@ -38,17 +39,72 @@ export interface CompactSummary {
 /**
  * 事件类型(判别联合)。
  *
- * thinking_finished 是 extended thinking 的定稿(带签名),必须入库:多轮带工具
+ * thinking_completed 是 extended thinking 的定稿(带签名),必须入库:多轮带工具
  * 调用时上一轮 thinking 要原样带签名回传,否则 Anthropic API 400。流式过程态
  * (开始/增量/结束)是 Delta、不入库。
  */
 type PublicAgentMessage = Extract<ProtocolPublicEvent, { type: "agent_message" }>;
+type PublicCompactionCompleted = Extract<
+  ProtocolPublicEvent,
+  { type: "compaction_completed" }
+>;
+type PublicHumanInteractionRequested = Extract<
+  ProtocolPublicEvent,
+  { type: "human_interaction_requested" }
+>;
+type InternalEventBase = Omit<
+  Extract<ProtocolPublicEvent, { type: "user_message" }>,
+  "type" | "source" | "text" | "triggerId"
+>;
 export type Event =
-  | Exclude<ProtocolPublicEvent, PublicAgentMessage>
-  | (PublicAgentMessage & { providerReplay?: ProviderReplayState })
-  | (Omit<Extract<ProtocolPublicEvent, { type: "user_message" }>, "type" | "text"> & {
+  | Exclude<
+      ProtocolPublicEvent,
+      | PublicAgentMessage
+      | PublicCompactionCompleted
+      | PublicHumanInteractionRequested
+    >
+  | PublicCompactionCompleted
+  | (PublicAgentMessage & {
+      providerReplay?: ProviderReplayState;
+      /** 内部恢复坐标；不公开，也不参与 LLM message 投影。 */
+      executionTrace?: {
+        runId: string;
+        step: number;
+        llmCallId: string;
+        projectedThroughSeq: number;
+      };
+    })
+  | (PublicHumanInteractionRequested & {
+      continuation: {
+        runId: string;
+        step: number;
+        llmCallId: string;
+        projectedThroughSeq: number;
+      };
+    })
+  | (PublicCompactionCompleted & {
+      replacesCompactionSeq?: number;
+      summaryVersion: 1;
+      summary: CompactSummary;
+      provider: string;
+      model: string;
+    })
+  | (InternalEventBase & {
+      /** Loop 注入的一次性上下文：持久化，但禁止进入 Public View。 */
+      type: "context_message";
+      source: "environment";
+      text: string;
+    })
+  | (InternalEventBase & {
+      /** Tool body 派发前的 write-ahead barrier；只用于 Conversation 恢复。 */
+      type: "tool_call_dispatched";
+      source: "environment";
+      toolCallId: string;
+    })
+  | (InternalEventBase & {
       /** 内部 checkpoint：落盘并参与投影，但禁止进入 Public View。 */
       type: "compacted";
+      source: "agent";
       compactionId: string;
       throughSeq: number;
       replacesCompactionSeq?: number;
@@ -58,6 +114,18 @@ export type Event =
       model: string;
       estimatedBeforeTokens: number;
       estimatedAfterTokens: number;
+    })
+  | (InternalEventBase & {
+      /** protocol v1 兼容；新代码只写 thinking_completed。 */
+      type: "thinking_finished";
+      source: "agent";
+      blocks: ThinkingBlock[];
+    })
+  | (InternalEventBase & {
+      /** protocol v1 兼容；新代码只写 agent_completed。 */
+      type: "finished";
+      source: "agent";
+      result: string;
     });
 
 /**
@@ -68,15 +136,56 @@ export type Event =
 export type StreamItem = Event | { delta: Delta };
 
 type AgentMessageEvent = Extract<Event, { type: "agent_message" }>;
-type CompactedEvent = Extract<Event, { type: "compacted" }>;
+type CompactionCheckpointEvent =
+  | Extract<Event, { type: "compacted" }>
+  | (Extract<Event, { type: "compaction_completed" }> & {
+      summaryVersion: 1;
+      summary: CompactSummary;
+      provider: string;
+      model: string;
+    });
 export type PublicEvent = ProtocolPublicEvent;
 export type PublicStreamItem = ProtocolPublicStreamItem;
 
-/** 唯一公开视图转换口；剥离 replay，并完全隐藏内部 checkpoint。 */
+/** 唯一公开视图转换口；剥离 replay，并完全隐藏内部事件。 */
 export function toPublicEvent(event: Event): PublicEvent | undefined {
-  if (event.type === "compacted") return undefined;
+  if (
+    event.type === "compacted" ||
+    event.type === "context_message" ||
+    event.type === "tool_call_dispatched"
+  ) {
+    return undefined;
+  }
+  if (event.type === "thinking_finished") {
+    const { type: _type, ...base } = event;
+    return { ...base, type: "thinking_completed" };
+  }
+  if (event.type === "finished") {
+    const { type: _type, ...base } = event;
+    return { ...base, type: "agent_completed" };
+  }
+  if (event.type === "compaction_completed") {
+    if (!("summary" in event)) return event;
+    const {
+      replacesCompactionSeq: _replacesCompactionSeq,
+      summaryVersion: _summaryVersion,
+      summary: _summary,
+      provider: _provider,
+      model: _model,
+      ...publicEvent
+    } = event;
+    return publicEvent;
+  }
+  if (event.type === "human_interaction_requested") {
+    const { continuation: _continuation, ...publicEvent } = event;
+    return publicEvent;
+  }
   if (event.type !== "agent_message") return event;
-  const { providerReplay: _providerReplay, ...publicEvent } = event;
+  const {
+    providerReplay: _providerReplay,
+    executionTrace: _executionTrace,
+    ...publicEvent
+  } = event;
   return publicEvent;
 }
 
@@ -271,24 +380,61 @@ export class EventStream {
 export interface CompactedProjection {
   messages: Message[];
   systemContext: string[];
-  checkpoint?: CompactedEvent;
+  checkpoint?: CompactionCheckpointEvent;
 }
 
 /** 应用最新 checkpoint；原始事件仍完整保留，只改变喂给 LLM 的投影视图。 */
 export function projectCompactedContext(events: Event[]): CompactedProjection {
   const checkpoint = events
-    .filter((event): event is CompactedEvent => event.type === "compacted")
+    .filter(
+      (event): event is CompactionCheckpointEvent =>
+        event.type === "compacted" ||
+        (event.type === "compaction_completed" && "summary" in event)
+    )
     .at(-1);
   if (!checkpoint) {
-    return { messages: projectToMessages(events), systemContext: [] };
+    return {
+      messages: [
+        ...projectToMessages(withoutContextMessages(events)),
+        ...projectActiveContextMessages(events),
+      ],
+      systemContext: [],
+    };
   }
   return {
-    messages: projectToMessages(
-      events.filter((event) => event.seq > checkpoint.throughSeq)
-    ),
+    messages: [
+      ...projectToMessages(
+        withoutContextMessages(
+          events.filter((event) => event.seq > checkpoint.throughSeq)
+        )
+      ),
+      ...projectActiveContextMessages(events),
+    ],
     systemContext: [serializeCompactSummary(checkpoint.summary)],
     checkpoint,
   };
+}
+
+/**
+ * `context_message` 只服务于下一次成功提交的 agent response。
+ * 其后尚无 agent_message 时仍有效；一旦出现更新的 agent_message 即自然失效。
+ */
+export function projectActiveContextMessages(events: Event[]): Message[] {
+  const lastAgentSeq = events.reduce(
+    (latest, event) =>
+      event.type === "agent_message" ? Math.max(latest, event.seq) : latest,
+    0
+  );
+  return events
+    .filter(
+      (event): event is Extract<Event, { type: "context_message" }> =>
+        event.type === "context_message" && event.seq > lastAgentSeq
+    )
+    .map((event) => ({ role: "user" as const, text: event.text }));
+}
+
+function withoutContextMessages(events: Event[]): Event[] {
+  return events.filter((event) => event.type !== "context_message");
 }
 
 export function serializeCompactSummary(summary: CompactSummary): string {
@@ -303,9 +449,9 @@ export function serializeCompactSummary(summary: CompactSummary): string {
  * 投影:事件流 → Message[](喂 LLM 的下游格式)。纯函数,不读时钟、无副作用。
  *
  * 三件非平凡的事:
- *  - 过滤:error/finished/interrupted 对 LLM 无意义,不产出 Message
+ *  - 过滤:error/agent_completed/interrupted 对 LLM 无意义,不产出 Message
  *  - 折叠:Anthropic 要求同一轮的 thinking block 与 text/tool_use 在同一条
- *    assistant message 里且 thinking 在前。事件流里 thinking_finished 是独立
+ *    assistant message 里且 thinking 在前。事件流里 thinking_completed 是独立
  *    一条,故投影时挂起、并入随后的 agent_message;若其后无 agent_message
  *    (纯思考轮,罕见),单独产出一条只含 thinking 的 message。签名为空的
  *    thinking block 一律丢弃(无签名回传必 400)。
@@ -349,7 +495,11 @@ export function projectToMessages(events: Event[]): Message[] {
         flushLoneThinking(); // 轮次切换，孤立思考先落地
         msgs.push({ role: "user", text: e.text });
         break;
-      case "thinking_finished": {
+      case "context_message":
+        // 一次性窗口需要观察完整事件序列；由 projectCompactedContext 统一后置附加。
+        break;
+      case "thinking_finished":
+      case "thinking_completed": {
         // 兜底：丢弃无签名的块(回传会 400)
         const signed = e.blocks.filter((b) => b.signature);
         pendingThinking.push(...signed);
@@ -391,8 +541,14 @@ export function projectToMessages(events: Event[]): Message[] {
         openToolCalls.delete(e.toolCallId);
         if (openToolCalls.size === 0) flushDeferredUsers();
         break;
+      case "tool_call_dispatched":
+      case "tool_policy_mode_changed":
+      case "human_interaction_requested":
+      case "human_interaction_resolved":
+        break;
       case "error":
       case "finished":
+      case "agent_completed":
       case "interrupted":
       case "compaction_started":
       case "compaction_completed":
@@ -433,4 +589,65 @@ export function findUnmatchedToolCalls(events: Event[]): ToolCall[] {
     }
   }
   return [...orphans.values()];
+}
+
+/** 最新 Conversation mode；legacy Conversation 没有事件时保持升级前 full_access。 */
+export function projectToolPolicyMode(
+  events: readonly Event[],
+  legacyFallback: ToolPolicyMode = "full_access"
+): ToolPolicyMode {
+  for (let index = events.length - 1; index >= 0; index--) {
+    const event = events[index];
+    if (event?.type === "tool_policy_mode_changed") return event.mode;
+  }
+  return legacyFallback;
+}
+
+export type HumanInteractionRequested = Extract<
+  Event,
+  { type: "human_interaction_requested" }
+>;
+export type HumanInteractionResolved = Extract<
+  Event,
+  { type: "human_interaction_resolved" }
+>;
+
+export function findHumanInteractionRequest(
+  events: readonly Event[],
+  interactionId: string
+): HumanInteractionRequested | undefined {
+  return events.find(
+    (event): event is HumanInteractionRequested =>
+      event.type === "human_interaction_requested" &&
+      event.interactionId === interactionId
+  );
+}
+
+export function findHumanInteractionResolution(
+  events: readonly Event[],
+  interactionId: string
+): HumanInteractionResolved | undefined {
+  return events.find(
+    (event): event is HumanInteractionResolved =>
+      event.type === "human_interaction_resolved" &&
+      event.interactionId === interactionId
+  );
+}
+
+export function findPendingHumanInteraction(
+  events: readonly Event[]
+): HumanInteractionRequested | undefined {
+  const resolved = new Set(
+    events
+      .filter(
+        (event): event is HumanInteractionResolved =>
+          event.type === "human_interaction_resolved"
+      )
+      .map((event) => event.interactionId)
+  );
+  return events.find(
+    (event): event is HumanInteractionRequested =>
+      event.type === "human_interaction_requested" &&
+      !resolved.has(event.interactionId)
+  );
 }

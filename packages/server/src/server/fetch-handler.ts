@@ -8,6 +8,8 @@ import {
   type TinyhandsErrorBody,
   type TinyhandsErrorCode,
   type PublicStreamItem,
+  type ToolPolicyMode,
+  type RespondToInteractionInput,
 } from "@tinyhands/protocol";
 import type { TinyhandsHost } from "./tinyhands-host.js";
 import {
@@ -17,8 +19,13 @@ import {
   ConversationServiceClosingError,
   EventStreamOverflowError,
   InvalidConversationInputError,
+  ConversationWaitingForInteractionError,
   type EventSubscription,
 } from "./conversation-service.js";
+import {
+  InteractionConflictError,
+  InteractionNotFoundError,
+} from "./human-interaction.js";
 
 const MAX_BODY_BYTES = 64 * 1024;
 const JSON_HEADERS = {
@@ -32,7 +39,8 @@ export interface CreateTinyhandsFetchHandlerOptions {
   authorize?: (
     request: Request,
     action: TinyhandsAction,
-    conversationId?: string
+    conversationId?: string,
+    details?: { toolPolicyMode?: ToolPolicyMode }
   ) => void | Response | Promise<void | Response>;
 }
 
@@ -50,10 +58,15 @@ export function createTinyhandsFetchHandler(
 
       if (path.length === 1 && path[0] === "conversations") {
         if (request.method === "POST") {
-          const denied = await options.authorize?.(request, "conversation:create");
-          if (denied instanceof Response) return denied;
           const body = await readJsonBody(request);
           const input = parseCreateInput(body);
+          const denied = await options.authorize?.(
+            request,
+            "conversation:create",
+            input.conversationId,
+            { toolPolicyMode: input.toolPolicy?.mode }
+          );
+          if (denied instanceof Response) return denied;
           const created = await options.host.conversations.create(input);
           return jsonResponse(created, 201);
         }
@@ -117,6 +130,45 @@ export function createTinyhandsFetchHandler(
         if (denied instanceof Response) return denied;
         return jsonResponse(
           await options.host.conversations.interrupt(conversationId)
+        );
+      }
+
+      if (path.length === 3 && path[2] === "tool-policy") {
+        if (request.method !== "PUT") return methodNotAllowed();
+        const body = await readJsonBody(request);
+        const mode = parseToolPolicyMode(body);
+        const denied = await options.authorize?.(
+          request,
+          "conversation:set_tool_policy",
+          conversationId,
+          { toolPolicyMode: mode }
+        );
+        if (denied instanceof Response) return denied;
+        return jsonResponse(
+          await options.host.conversations.setToolPolicy(conversationId, { mode })
+        );
+      }
+
+      if (
+        path.length === 5 &&
+        path[2] === "interactions" &&
+        path[4] === "respond"
+      ) {
+        if (request.method !== "POST") return methodNotAllowed();
+        const interactionId = decodePathSegment(path[3]!);
+        const denied = await options.authorize?.(
+          request,
+          "conversation:respond_interaction",
+          conversationId
+        );
+        if (denied instanceof Response) return denied;
+        const input = parseInteractionResponse(await readJsonBody(request));
+        return jsonResponse(
+          await options.host.conversations.respondToInteraction(
+            conversationId,
+            interactionId,
+            input
+          )
         );
       }
 
@@ -253,11 +305,12 @@ async function readJsonBody(request: Request): Promise<unknown> {
 function parseCreateInput(value: unknown): {
   conversationId?: string;
   tools?: string[];
+  toolPolicy?: { mode: ToolPolicyMode };
 } {
   if (!isRecord(value)) {
     throw new InvalidConversationInputError("请求体必须是 JSON object");
   }
-  const { conversationId, tools } = value;
+  const { conversationId, tools, toolPolicy } = value;
   if (conversationId !== undefined && typeof conversationId !== "string") {
     throw new InvalidConversationInputError("conversationId 必须是字符串");
   }
@@ -267,9 +320,58 @@ function parseCreateInput(value: unknown): {
   ) {
     throw new InvalidConversationInputError("tools 必须是字符串数组");
   }
+  if (
+    toolPolicy !== undefined &&
+    (!isRecord(toolPolicy) || !isToolPolicyMode(toolPolicy.mode))
+  ) {
+    throw new InvalidConversationInputError("toolPolicy.mode 不合法");
+  }
   return {
     ...(conversationId !== undefined ? { conversationId } : {}),
     ...(tools !== undefined ? { tools: tools as string[] } : {}),
+    ...(toolPolicy !== undefined
+      ? { toolPolicy: { mode: toolPolicy.mode as ToolPolicyMode } }
+      : {}),
+  };
+}
+
+function parseToolPolicyMode(value: unknown): ToolPolicyMode {
+  if (!isRecord(value) || !isToolPolicyMode(value.mode)) {
+    throw new InvalidConversationInputError("mode 必须是合法 ToolPolicyMode");
+  }
+  return value.mode;
+}
+
+function isToolPolicyMode(value: unknown): value is ToolPolicyMode {
+  return (
+    value === "request_approval" ||
+    value === "default" ||
+    value === "full_access"
+  );
+}
+
+function parseInteractionResponse(
+  value: unknown
+): RespondToInteractionInput<"approval"> {
+  if (
+    !isRecord(value) ||
+    value.interactionType !== "approval" ||
+    !isRecord(value.response) ||
+    (value.response.decision !== "approve" &&
+      value.response.decision !== "reject") ||
+    (value.response.reason !== undefined &&
+      typeof value.response.reason !== "string")
+  ) {
+    throw new InvalidConversationInputError("approval response 格式不合法");
+  }
+  return {
+    interactionType: "approval",
+    response: {
+      decision: value.response.decision,
+      ...(value.response.reason !== undefined
+        ? { reason: value.response.reason }
+        : {}),
+    },
   };
 }
 
@@ -285,6 +387,19 @@ function mapError(error: unknown): Response {
   }
   if (error instanceof ConversationNotFoundError) {
     return protocolError(404, "conversation_not_found", error.message);
+  }
+  if (error instanceof ConversationWaitingForInteractionError) {
+    return protocolError(
+      409,
+      "conversation_waiting_for_interaction",
+      error.message
+    );
+  }
+  if (error instanceof InteractionNotFoundError) {
+    return protocolError(404, "interaction_not_found", error.message);
+  }
+  if (error instanceof InteractionConflictError) {
+    return protocolError(409, "interaction_conflict", error.message);
   }
   if (error instanceof ConversationServiceClosingError) {
     return protocolError(503, "host_closing", error.message);

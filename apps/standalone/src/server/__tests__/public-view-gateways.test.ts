@@ -54,8 +54,8 @@ async function serviceFor(conversation: Conversation): Promise<ConversationServi
       conversationId,
       conversation,
       agent: {} as never,
-      journal: {} as never,
-      runtime: { kill: async () => {} } as Runtime,
+      journal: { recoverOpenRuns: async () => {} } as never,
+      runtime: { start: async () => {}, close: async () => {} } as Runtime,
       conversationCreatedAt: Date.now(),
     }),
   });

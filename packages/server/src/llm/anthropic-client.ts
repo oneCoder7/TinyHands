@@ -238,7 +238,7 @@ function normalizeAnthropicStopReason(
     case "stop_sequence":
       return "end_turn";
     case "tool_use":
-      return "tool_use";
+      return "tool_call";
     case "max_tokens":
       return "max_tokens";
     case "refusal":

@@ -8,6 +8,7 @@ import type { Tool } from "../tools/tool.js";
 import type { Conversation } from "../conversation/conversation.js";
 import {
   projectCompactedContext,
+  projectActiveContextMessages,
   projectToMessages,
   serializeCompactSummary,
   type CompactSummary,
@@ -45,21 +46,19 @@ const SUMMARY_SYSTEM = `你是上下文压缩器。把提供的历史数据合�
   "narrative"?: string
 }`;
 
-export interface PreparedContext {
+export interface CompactionPreparation {
   messages: Message[];
   systemContext: string[];
-  projectedThroughSeq: number;
   estimatedInputTokens: number;
   compacted: boolean;
 }
 
 export interface ContextCompactorLike {
   prepare(
-    conversation: Conversation,
     events: Event[],
     tools: Tool[],
     options: { runId: string; step: number; signal?: AbortSignal }
-  ): Promise<PreparedContext>;
+  ): Promise<CompactionPreparation>;
 }
 
 export class CompactionError extends Error {
@@ -136,6 +135,7 @@ export function findSafeCompactionBoundaries(
     let relevant = false;
     switch (event.type) {
       case "thinking_finished":
+      case "thinking_completed":
         pendingThinking = true;
         relevant = true;
         break;
@@ -168,17 +168,17 @@ export class ContextCompactor implements ContextCompactorLike {
     private readonly llm: LLMClient,
     private readonly journal: RunJournal,
     private readonly config: AutoCompactConfig,
-    maxOutputTokens: number
+    maxOutputTokens: number,
+    private readonly conversation: Conversation
   ) {
     this.budget = calculateCompactionBudget(config, maxOutputTokens);
   }
 
   async prepare(
-    conversation: Conversation,
     events: Event[],
     tools: Tool[],
     options: { runId: string; step: number; signal?: AbortSignal }
-  ): Promise<PreparedContext> {
+  ): Promise<CompactionPreparation> {
     const projectedThroughSeq = events.at(-1)?.seq ?? 0;
     const current = projectCompactedContext(events);
     const estimatedInputTokens = this.estimateWithUsageBaseline(
@@ -188,10 +188,9 @@ export class ContextCompactor implements ContextCompactorLike {
       tools,
       projectedThroughSeq
     );
-    const unchanged = (): PreparedContext => ({
+    const unchanged = (): CompactionPreparation => ({
       messages: current.messages,
       systemContext: current.systemContext,
-      projectedThroughSeq,
       estimatedInputTokens,
       compacted: false,
     });
@@ -202,7 +201,7 @@ export class ContextCompactor implements ContextCompactorLike {
     if (options.signal?.aborted) throw new CompactionInterruptedError();
 
     const compactionId = randomUUID();
-    await conversation.emit({
+    await this.conversation.emit({
       type: "compaction_started",
       source: "agent",
       compactionId,
@@ -232,7 +231,7 @@ export class ContextCompactor implements ContextCompactorLike {
         baseThroughSeq,
         protectedUserSeq
       ).filter((throughSeq) =>
-        projectToMessages(
+        projectCompactionHistory(
           events.filter(
             (event) =>
               event.seq > baseThroughSeq && event.seq <= throughSeq
@@ -241,9 +240,7 @@ export class ContextCompactor implements ContextCompactorLike {
       );
 
       let boundaryIndex = boundaries.findIndex((throughSeq) => {
-        const tail = projectToMessages(
-          events.filter((event) => event.seq > throughSeq)
-        );
+        const tail = projectCompactionTail(events, throughSeq);
         return (
           estimateCanonicalInputTokens(tail, [], tools) +
             this.budget.summaryMaxTokens <=
@@ -251,9 +248,12 @@ export class ContextCompactor implements ContextCompactorLike {
         );
       });
       if (boundaryIndex === -1) {
-        const protectedTail = projectToMessages(
-          events.filter((event) => event.seq >= protectedUserSeq)
-        );
+        const protectedTail = [
+          ...projectCompactionHistory(
+            events.filter((event) => event.seq >= protectedUserSeq)
+          ),
+          ...projectActiveContextMessages(events),
+        ];
         const protectedEstimate = estimateCanonicalInputTokens(
           protectedTail,
           [],
@@ -277,7 +277,7 @@ export class ContextCompactor implements ContextCompactorLike {
             "扩大压缩前缀后仍无法满足目标预算"
           );
         }
-        const prefixMessages = projectToMessages(
+        const prefixMessages = projectCompactionHistory(
           events.filter(
             (event) =>
               event.seq > baseThroughSeq && event.seq <= throughSeq
@@ -296,16 +296,14 @@ export class ContextCompactor implements ContextCompactorLike {
             ...options,
             llmCallId: generated.llmCallId,
             compactionId,
-            outcome: "discarded",
+            disposition: "discarded",
             reason: "user_interrupt",
             eventSeqs: [],
           });
           throw new CompactionInterruptedError();
         }
 
-        const tailMessages = projectToMessages(
-          events.filter((event) => event.seq > throughSeq)
-        );
+        const tailMessages = projectCompactionTail(events, throughSeq);
         const systemContext = [serializeCompactSummary(generated.summary)];
         const estimatedAfterTokens = estimateCanonicalInputTokens(
           tailMessages,
@@ -317,7 +315,7 @@ export class ContextCompactor implements ContextCompactorLike {
             ...options,
             llmCallId: generated.llmCallId,
             compactionId,
-            outcome: "discarded",
+            disposition: "discarded",
             reason: "summary_too_large",
             eventSeqs: [],
           });
@@ -327,8 +325,8 @@ export class ContextCompactor implements ContextCompactorLike {
 
         let checkpoint;
         try {
-          checkpoint = await conversation.emit({
-            type: "compacted",
+          checkpoint = await this.conversation.emit({
+            type: "compaction_completed",
             source: "agent",
             compactionId,
             throughSeq,
@@ -347,7 +345,7 @@ export class ContextCompactor implements ContextCompactorLike {
             ...options,
             llmCallId: generated.llmCallId,
             compactionId,
-            outcome: "discarded",
+            disposition: "discarded",
             reason: "persistence_error",
             eventSeqs: [],
           });
@@ -364,21 +362,13 @@ export class ContextCompactor implements ContextCompactorLike {
             ...options,
             llmCallId: generated.llmCallId,
             compactionId,
-            outcome: "committed",
+            disposition: "committed",
             eventSeqs: [checkpoint.seq],
           });
         } catch (error) {
           dispositionError = error;
         }
 
-        await this.emitCompletedWithRetry(conversation, {
-          type: "compaction_completed",
-          source: "agent",
-          compactionId,
-          throughSeq,
-          estimatedBeforeTokens: estimatedInputTokens,
-          estimatedAfterTokens,
-        });
         if (dispositionError) {
           throw new CompactionError(
             "persistence_error",
@@ -390,7 +380,6 @@ export class ContextCompactor implements ContextCompactorLike {
         return {
           messages: tailMessages,
           systemContext,
-          projectedThroughSeq,
           estimatedInputTokens: estimatedAfterTokens,
           compacted: true,
         };
@@ -403,7 +392,7 @@ export class ContextCompactor implements ContextCompactorLike {
     } catch (error) {
       if (checkpointCommitted) throw error;
       if (options.signal?.aborted || error instanceof CompactionInterruptedError) {
-        await conversation.emit({
+        await this.conversation.emit({
           type: "compaction_cancelled",
           source: "agent",
           compactionId,
@@ -416,7 +405,7 @@ export class ContextCompactor implements ContextCompactorLike {
           ? error
           : new CompactionError("provider_error", errorMessage(error));
       try {
-        await conversation.emit({
+        await this.conversation.emit({
           type: "compaction_failed",
           source: "agent",
           compactionId,
@@ -487,7 +476,7 @@ export class ContextCompactor implements ContextCompactorLike {
             step: options.step,
             llmCallId,
             purpose: "compaction",
-            outcome: aborted ? "aborted" : "provider_error",
+            reason: aborted ? "aborted" : "provider_error",
             durationMs: Date.now() - startedAt,
             errorCode: aborted
               ? "compaction_llm_aborted"
@@ -533,7 +522,7 @@ export class ContextCompactor implements ContextCompactorLike {
           ...options,
           llmCallId,
           compactionId,
-          outcome: "discarded",
+          disposition: "discarded",
           reason: "user_interrupt",
           eventSeqs: [],
         });
@@ -557,7 +546,7 @@ export class ContextCompactor implements ContextCompactorLike {
         ...options,
         llmCallId,
         compactionId,
-        outcome: "discarded",
+        disposition: "discarded",
         reason: "invalid_summary",
         eventSeqs: [],
       });
@@ -573,7 +562,7 @@ export class ContextCompactor implements ContextCompactorLike {
     step: number;
     llmCallId: string;
     compactionId: string;
-    outcome: "committed" | "discarded";
+    disposition: "committed" | "discarded";
     reason?: "user_interrupt" | "invalid_summary" | "summary_too_large" | "persistence_error";
     eventSeqs: number[];
     signal?: AbortSignal;
@@ -586,27 +575,6 @@ export class ContextCompactor implements ContextCompactorLike {
         "persistence_error",
         `压缩 llm_disposition 落盘失败：${errorMessage(error)}`
       );
-    }
-  }
-
-  private async emitCompletedWithRetry(
-    conversation: Conversation,
-    draft: Extract<
-      import("../conversation/events.js").EventDraft,
-      { type: "compaction_completed" }
-    >
-  ): Promise<void> {
-    try {
-      await conversation.emit(draft);
-    } catch {
-      try {
-        await conversation.emit(draft);
-      } catch (error) {
-        throw new CompactionError(
-          "persistence_error",
-          `checkpoint 已提交，但 completed 落盘失败：${errorMessage(error)}`
-        );
-      }
     }
   }
 
@@ -696,6 +664,23 @@ function summaryPayload(
       thinking: message.thinkingBlocks?.map((block) => block.thinking),
     })),
   });
+}
+
+/** 压缩摘要永远不读取 Loop 注入的一次性 context_message。 */
+function projectCompactionHistory(events: Event[]): Message[] {
+  return projectToMessages(
+    events.filter((event) => event.type !== "context_message")
+  );
+}
+
+/** 压缩后的正常 tail 加上仍有效的一次性上下文。 */
+function projectCompactionTail(events: Event[], throughSeq: number): Message[] {
+  return [
+    ...projectCompactionHistory(
+      events.filter((event) => event.seq > throughSeq)
+    ),
+    ...projectActiveContextMessages(events),
+  ];
 }
 
 function errorMessage(error: unknown): string {

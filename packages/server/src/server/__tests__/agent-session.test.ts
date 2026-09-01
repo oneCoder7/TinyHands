@@ -12,12 +12,13 @@ import {
   AgentSession,
   makeAgentSessionFactory,
 } from "../agent-session.js";
+import { HumanInteractionCoordinator } from "../human-interaction.js";
 
 describe("AgentSession 执行关联", () => {
   it("独占 Runtime 生命周期，并通过显式 run context 交给 Agent", async () => {
     const runtime = {
-      create: vi.fn(async () => {}),
-      kill: vi.fn(async () => {}),
+      start: vi.fn(async () => {}),
+      close: vi.fn(async () => {}),
     } as unknown as Runtime;
     const run = vi.fn(
       async (
@@ -38,7 +39,10 @@ describe("AgentSession 执行关联", () => {
       conversation: new Conversation("owned"),
       runtime,
       agent: { run } as never,
-      journal: { append: vi.fn(async () => {}) } as never,
+      journal: {
+        append: vi.fn(async () => {}),
+        recoverOpenRuns: vi.fn(async () => {}),
+      } as never,
       conversationCreatedAt: Date.now(),
     });
 
@@ -50,8 +54,8 @@ describe("AgentSession 执行关联", () => {
     await vi.waitFor(() => expect(session.running).toBe(false));
     await Promise.all([session.close(), session.close()]);
 
-    expect(runtime.create).toHaveBeenCalledTimes(1);
-    expect(runtime.kill).toHaveBeenCalledTimes(1);
+    expect(runtime.start).toHaveBeenCalledTimes(1);
+    expect(runtime.close).toHaveBeenCalledTimes(1);
   });
 
   it("submit 返回并持久化 triggerId，Run Log 闭合到 run_completed", async () => {
@@ -61,7 +65,7 @@ describe("AgentSession 执行关联", () => {
     const llm: LLMClient = {
       identity: { provider: "test", model: "model-1", apiMode: "messages" },
       chat: vi.fn(async (): Promise<LLMResponse> => ({
-        stopReason: "tool_use",
+        stopReason: "tool_call",
         text: "",
         toolCalls: [
           { id: "finish-1", name: "finish", args: { result: "done" } },
@@ -107,8 +111,8 @@ describe("AgentSession 执行关联", () => {
       "llm_started",
       "llm_completed",
       "llm_disposition",
-      "tool_started",
-      "tool_completed",
+      "tool_call_dispatched",
+      "tool_call_completed",
       "step_completed",
       "run_completed",
     ]);
@@ -136,7 +140,7 @@ describe("AgentSession 执行关联", () => {
           })
       )
       .mockImplementationOnce(async () => ({
-        stopReason: "tool_use",
+        stopReason: "tool_call",
         text: "",
         toolCalls: [
           { id: "finish-2", name: "finish", args: { result: "second done" } },
@@ -178,7 +182,7 @@ describe("AgentSession 执行关联", () => {
         .find((event) => event.seq === second.userMessageSeq)
     ).toMatchObject({ type: "user_message", text: "second" });
     expect(session.conversation.getEvents().at(-1)).toMatchObject({
-      type: "finished",
+      type: "agent_completed",
       result: "second done",
     });
     const completedRuns = (await runLogStore.loadAndRepair("c2")).filter(
@@ -187,5 +191,88 @@ describe("AgentSession 执行关联", () => {
     expect(completedRuns).toHaveLength(2);
     expect(completedRuns[0]).toMatchObject({ status: "interrupted" });
     expect(completedRuns[1]).toMatchObject({ status: "completed" });
+  });
+
+  it("审批拒绝后配对 tool_result，并从原 run/step 继续", async () => {
+    const root = mkdtempSync(join(tmpdir(), "tinyhands-approval-test-"));
+    const conversationStore = new FsConversationStore(root);
+    const runLogStore = new FsRunLogStore(root);
+    const chat = vi
+      .fn<LLMClient["chat"]>()
+      .mockResolvedValueOnce({
+        stopReason: "tool_call",
+        text: "",
+        toolCalls: [{
+          id: "write-1",
+          name: "write_file",
+          args: { path: "blocked.txt", content: "x" },
+        }],
+        usage: { status: "not_reported" },
+      })
+      .mockResolvedValueOnce({
+        stopReason: "tool_call",
+        text: "",
+        toolCalls: [
+          { id: "finish-1", name: "finish", args: { result: "done" } },
+        ],
+        usage: { status: "not_reported" },
+      });
+    const createSession = makeAgentSessionFactory({
+      llm: {
+        identity: { provider: "test", model: "model", apiMode: "messages" },
+        chat,
+      },
+      maxStep: 3,
+      runtime: { type: "local" },
+      conversationStore,
+      runLogStore,
+    });
+    const session = await createSession({
+      conversationId: "approval",
+      workspaceDir: join(root, "approval"),
+      tools: [],
+    });
+    await session.conversation.emit({
+      type: "tool_policy_mode_changed",
+      source: "environment",
+      mode: "default",
+    });
+
+    await session.submit("go");
+    await vi.waitFor(() => expect(session.waitingForInteraction).toBe(true));
+    await expect(session.submit("must not persist")).rejects.toThrow(
+      "等待 human interaction"
+    );
+    expect(session.conversation.getEvents().filter(
+      (event) => event.type === "user_message"
+    )).toHaveLength(1);
+    const request = session.conversation
+      .getEvents()
+      .find((event) => event.type === "human_interaction_requested");
+    if (!request || request.type !== "human_interaction_requested") {
+      throw new Error("missing interaction");
+    }
+    await new HumanInteractionCoordinator().respond(
+      session.conversation,
+      request.interactionId,
+      {
+        interactionType: "approval",
+        response: { decision: "reject", reason: "not now" },
+      }
+    );
+    await session.resumeInteraction(request);
+    await vi.waitFor(() => expect(session.running).toBe(false));
+
+    expect(chat).toHaveBeenCalledTimes(2);
+    expect(session.conversation.getEvents().find(
+      (event) => event.type === "tool_result" && event.toolCallId === "write-1"
+    )).toMatchObject({ isError: true, content: "工具调用未获批准：not now" });
+    expect(session.conversation.getEvents().at(-1)).toMatchObject({
+      type: "agent_completed",
+      result: "done",
+    });
+    expect((await runLogStore.loadAndRepair("approval")).filter(
+      (record) => record.type === "run_started"
+    )).toHaveLength(1);
   });
 });

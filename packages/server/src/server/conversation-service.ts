@@ -4,6 +4,7 @@ import { join, resolve, sep } from "node:path";
 import {
   type AgentSession,
   type SessionFactory,
+  ConversationWaitingForInteractionError,
 } from "./agent-session.js";
 import {
   ConversationRecordExistsError,
@@ -11,6 +12,10 @@ import {
 } from "../conversation/conversation-store.js";
 import {
   findUnmatchedToolCalls,
+  findHumanInteractionRequest,
+  findHumanInteractionResolution,
+  findPendingHumanInteraction,
+  projectToolPolicyMode,
   type Event,
   type PublicEventHandler,
   type PublicStreamItem,
@@ -22,8 +27,16 @@ import type {
   DeleteConversationResult,
   EventSubscriptionCloseReason,
   InterruptResult,
+  RespondToInteractionInput,
+  RespondToInteractionResult,
+  SetToolPolicyResult,
+  ConversationToolPolicyInput,
   SendMessageResult,
+  ToolPolicyMode,
 } from "@tinyhands/protocol";
+import { HumanInteractionCoordinator } from "./human-interaction.js";
+
+export { ConversationWaitingForInteractionError } from "./agent-session.js";
 import { listOptionalToolNames } from "../tools/catalog.js";
 import {
   noopLogger,
@@ -81,6 +94,15 @@ export interface ConversationService {
   create(input?: CreateConversationInput): Promise<ConversationInfo>;
   send(conversationId: string, text: string): Promise<SendMessageResult>;
   interrupt(conversationId: string): Promise<InterruptResult>;
+  setToolPolicy(
+    conversationId: string,
+    policy: ConversationToolPolicyInput
+  ): Promise<SetToolPolicyResult>;
+  respondToInteraction(
+    conversationId: string,
+    interactionId: string,
+    input: RespondToInteractionInput<"approval">
+  ): Promise<RespondToInteractionResult>;
   events(
     conversationId: string,
     options?: OpenEventStreamOptions
@@ -100,7 +122,8 @@ export interface ConversationService {
  *  - create:mkdir 专属 workspace + 经工厂装配会话(空事件流,不起 runtime)。id 可
  *    外部指定,不传则生成 UUID。
  *  - resolve:内存命中直接返回;未命中则从 ConversationStore 懒加载恢复(load 历史 →
- *    装配会话 → 孤儿 tool_call 补偿)。恢复纯读磁盘,绝不触发 runtime(D10)。
+ *    装配会话 → 按 Event 恢复 ToolCall)。普通历史不触发 runtime；仅存在可安全继续的
+ *    continuation 时恢复原 run。
  *  - delete:Map 移除 + 关闭公开订阅 + rm -rf workspace(含 events.jsonl)。
  *    协作式止血:abort 让 run 撞检查点终结,但不杀进行中的工具进程。
  *
@@ -114,6 +137,7 @@ export class DefaultConversationService implements ConversationService {
   private readonly workspaceRoot: string;
   private readonly createSession: SessionFactory;
   private readonly store: ConversationStore;
+  private readonly defaultToolPolicyMode: ToolPolicyMode;
   private readonly log: TinyhandsLogger;
   private readonly subscriptions = new Map<string, Set<EventSubscriptionImpl>>();
   /** 同一 conversationId 的 create/resume/destroy 必须串行，避免双实例与删除后复活。 */
@@ -127,11 +151,14 @@ export class DefaultConversationService implements ConversationService {
     workspaceRoot: string;
     createSession: SessionFactory;
     conversationStore: ConversationStore;
+    defaultToolPolicyMode?: ToolPolicyMode;
     logger?: TinyhandsLogger;
   }) {
     this.workspaceRoot = opts.workspaceRoot;
     this.createSession = opts.createSession;
     this.store = opts.conversationStore;
+    validateToolPolicyMode(opts.defaultToolPolicyMode);
+    this.defaultToolPolicyMode = opts.defaultToolPolicyMode ?? "default";
     this.log = (opts.logger ?? noopLogger).child({
       module: "conversation-service",
     });
@@ -142,6 +169,7 @@ export class DefaultConversationService implements ConversationService {
     const conversationId = input.conversationId ?? randomUUID();
     validateConversationId(conversationId);
     validateTools(input.tools);
+    validateToolPolicyMode(input.toolPolicy?.mode);
 
     return this.withOperation(conversationId, async () => {
       if (this.map.has(conversationId)) {
@@ -172,6 +200,11 @@ export class DefaultConversationService implements ConversationService {
           conversationId,
           createdAt: session.conversationCreatedAt,
           tools: input.tools,
+        });
+        await session.conversation.emit({
+          type: "tool_policy_mode_changed",
+          source: "environment",
+          mode: input.toolPolicy?.mode ?? this.defaultToolPolicyMode,
         });
       } catch (err) {
         if (err instanceof ConversationRecordExistsError) {
@@ -229,6 +262,53 @@ export class DefaultConversationService implements ConversationService {
     });
   }
 
+  async setToolPolicy(
+    conversationId: string,
+    policy: ConversationToolPolicyInput
+  ): Promise<SetToolPolicyResult> {
+    this.assertOpen();
+    validateConversationId(conversationId);
+    validateToolPolicyMode(policy?.mode);
+    return this.withOperation(conversationId, async () => {
+      const session = await this.resolveSession(conversationId);
+      if (!session) throw new ConversationNotFoundError(conversationId);
+      const current = projectToolPolicyMode(session.conversation.getEvents());
+      if (current === policy.mode) return { mode: current, changed: false };
+      await session.conversation.emit({
+        type: "tool_policy_mode_changed",
+        source: "environment",
+        mode: policy.mode,
+      });
+      return { mode: policy.mode, changed: true };
+    });
+  }
+
+  async respondToInteraction(
+    conversationId: string,
+    interactionId: string,
+    input: RespondToInteractionInput<"approval">
+  ): Promise<RespondToInteractionResult> {
+    this.assertOpen();
+    validateConversationId(conversationId);
+    if (!interactionId) {
+      throw new InvalidConversationInputError("interactionId 不能为空");
+    }
+    return this.withOperation(conversationId, async () => {
+      const session = await this.resolveSession(conversationId);
+      if (!session) throw new ConversationNotFoundError(conversationId);
+      const events = session.conversation.getEvents();
+      const request = findHumanInteractionRequest(events, interactionId);
+      const alreadyResolved = findHumanInteractionResolution(events, interactionId);
+      const result = await new HumanInteractionCoordinator().respond(
+        session.conversation,
+        interactionId,
+        input
+      );
+      if (request && !alreadyResolved) void session.resumeInteraction(request);
+      return result;
+    });
+  }
+
   async events(
     conversationId: string,
     options: OpenEventStreamOptions = {}
@@ -268,8 +348,8 @@ export class DefaultConversationService implements ConversationService {
 
   /**
    * 取会话,内存未命中则从磁盘懒加载恢复。恢复 = load 历史 events → 装配会话 →
-   * 孤儿 tool_call 补偿(给崩在「tool_use 已落、tool_result 未落」窗口的尾部补配对)。
-   * 全程纯读磁盘 + 装配,绝不 runtime.create()(runtime 惰性,首次 driveRun 才起)。
+   * ToolCall 恢复只读取 Conversation Event：未派发的 continuation 可继续，已派发但
+   * 结果未知的调用只补 error result，绝不重试副作用。普通历史不会启动 runtime。
    *
    * 并发安全:同一 id 的并发 resolve 经 per-ID coordinator 串行，不会重复装配。
    *
@@ -314,16 +394,40 @@ export class DefaultConversationService implements ConversationService {
     // process_restarted cancelled。两种修复都只追加事件，不重放摘要请求。
     await recoverOpenCompactions(session);
 
-    // 孤儿 tool_call 补偿:崩在「tool_use 已落盘、tool_result 未落盘」窗口,
-    // 尾部残留无配对的 tool_use。按 toolCallId 各补一条 isError tool_result,
-    // 否则重投影喂 LLM 必 400(Anthropic 硬约束)。与 agent 检查点③同一模式。
-    const orphans = findUnmatchedToolCalls(events);
-    if (orphans.length > 0) {
+    const currentEvents = session.conversation.getEvents();
+    const pending = findPendingHumanInteraction(currentEvents);
+    const protectedRunIds = new Set<string>();
+    if (pending) protectedRunIds.add(pending.continuation.runId);
+
+    // 只有已经派发但没有结果的调用属于副作用未知窗口，绝不自动重试。
+    // 等待审批、已批准未派发都保留原 run，由 Conversation Event 坐标恢复。
+    const orphans = findUnmatchedToolCalls(currentEvents);
+    const dispatched = new Set(
+      currentEvents
+        .filter((event) => event.type === "tool_call_dispatched")
+        .map((event) => event.toolCallId)
+    );
+    const agentMessages = currentEvents.filter(
+      (event): event is Extract<Event, { type: "agent_message" }> =>
+        event.type === "agent_message"
+    );
+    const unsafeMessageCalls = new Set(
+      agentMessages.flatMap((event) => {
+        const callIds = event.toolCalls.map((call) => call.id);
+        return !event.executionTrace || callIds.some((id) => dispatched.has(id))
+          ? callIds
+          : [];
+      })
+    );
+    const unsafe = orphans.filter(
+      (call) => unsafeMessageCalls.has(call.id)
+    );
+    if (unsafe.length > 0) {
       this.log.warn(
-        { conversationId: id, count: orphans.length },
-        "恢复发现孤儿 tool_call,补偿 error tool_result"
+        { conversationId: id, count: unsafe.length },
+        "恢复发现已派发但结果未知的 tool_call，补偿 error tool_result"
       );
-      for (const tc of orphans) {
+      for (const tc of unsafe) {
         await session.conversation.emit({
           type: "tool_result",
           source: "environment",
@@ -332,6 +436,39 @@ export class DefaultConversationService implements ConversationService {
           isError: true,
         });
       }
+    }
+
+    const resumableRequest = [...currentEvents]
+      .reverse()
+      .find(
+        (event) =>
+          event.type === "human_interaction_requested" &&
+          !!findHumanInteractionResolution(currentEvents, event.interactionId) &&
+          orphans.some((call) => call.id === event.request.target.toolCallId) &&
+          !dispatched.has(event.request.target.toolCallId)
+      );
+    if (resumableRequest?.type === "human_interaction_requested") {
+      protectedRunIds.add(resumableRequest.continuation.runId);
+    }
+    const resumableAgentMessage = [...agentMessages]
+      .reverse()
+      .find(
+        (event) =>
+          !!event.executionTrace &&
+          event.toolCalls.some((call) =>
+            orphans.some((orphan) => orphan.id === call.id)
+          ) &&
+          event.toolCalls.every((call) => !unsafeMessageCalls.has(call.id)) &&
+          !resumableRequest
+      );
+    if (resumableAgentMessage?.executionTrace) {
+      protectedRunIds.add(resumableAgentMessage.executionTrace.runId);
+    }
+    await session.recoverOpenRuns(protectedRunIds);
+    if (resumableRequest?.type === "human_interaction_requested") {
+      void session.resumeInteraction(resumableRequest);
+    } else if (resumableAgentMessage) {
+      void session.resumeAgentMessage(resumableAgentMessage);
     }
 
     // 日志订阅者(与 create 同款,恢复路径也要挂)。
@@ -539,6 +676,17 @@ function validateTools(tools: string[] | undefined): void {
   }
 }
 
+function validateToolPolicyMode(mode: ToolPolicyMode | undefined): void {
+  if (mode === undefined) return;
+  if (
+    mode !== "request_approval" &&
+    mode !== "default" &&
+    mode !== "full_access"
+  ) {
+    throw new InvalidConversationInputError("toolPolicy.mode 不合法");
+  }
+}
+
 /**
  * Public event 的单消费者异步队列。构造时在同一同步调用栈内取得 backlog 并注册
  * live handler，因此 backlog 之后到达的事件只会排在其后，不留 transport 级竞态窗。
@@ -679,7 +827,15 @@ async function recoverOpenCompactions(session: AgentSession): Promise<void> {
     {
       started: boolean;
       terminal: boolean;
-      checkpoint?: Extract<Event, { type: "compacted" }>;
+      checkpoint?:
+        | Extract<Event, { type: "compacted" }>
+        | (Extract<Event, { type: "compaction_completed" }> & {
+            replacesCompactionSeq?: number;
+            summaryVersion: 1;
+            summary: import("../conversation/events.js").CompactSummary;
+            provider: string;
+            model: string;
+          });
     }
   >();
   for (const event of session.conversation.getEvents()) {
@@ -697,7 +853,12 @@ async function recoverOpenCompactions(session: AgentSession): Promise<void> {
       terminal: false,
     };
     if (event.type === "compaction_started") state.started = true;
-    if (event.type === "compacted") state.checkpoint = event;
+    if (
+      event.type === "compacted" ||
+      (event.type === "compaction_completed" && "summary" in event)
+    ) {
+      state.checkpoint = event;
+    }
     if (
       event.type === "compaction_completed" ||
       event.type === "compaction_cancelled" ||
@@ -716,6 +877,13 @@ async function recoverOpenCompactions(session: AgentSession): Promise<void> {
         source: "agent",
         compactionId,
         throughSeq: state.checkpoint.throughSeq,
+        ...(state.checkpoint.replacesCompactionSeq !== undefined
+          ? { replacesCompactionSeq: state.checkpoint.replacesCompactionSeq }
+          : {}),
+        summaryVersion: state.checkpoint.summaryVersion,
+        summary: state.checkpoint.summary,
+        provider: state.checkpoint.provider,
+        model: state.checkpoint.model,
         estimatedBeforeTokens: state.checkpoint.estimatedBeforeTokens,
         estimatedAfterTokens: state.checkpoint.estimatedAfterTokens,
       });

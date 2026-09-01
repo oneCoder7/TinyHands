@@ -1,4 +1,4 @@
-export const TINYHANDS_PROTOCOL_VERSION = 1 as const;
+export const TINYHANDS_PROTOCOL_VERSION = 2 as const;
 
 export interface ToolCall {
   id: string;
@@ -33,6 +33,53 @@ export type CompactionFailureCode =
   | "provider_error"
   | "persistence_error";
 
+export type ToolPolicyMode =
+  | "request_approval"
+  | "default"
+  | "full_access";
+
+export interface ConversationToolPolicyInput {
+  mode: ToolPolicyMode;
+}
+
+export interface HumanInteractionRequestMap {
+  approval: {
+    target: { type: "tool_call"; toolCallId: string };
+    reason: string;
+  };
+}
+
+export interface HumanInteractionResponseMap {
+  approval: {
+    decision: "approve" | "reject";
+    reason?: string;
+  };
+}
+
+export type HumanInteractionType = keyof HumanInteractionRequestMap;
+
+export type HumanInteractionRequestedEvent = {
+  [K in HumanInteractionType]: BasePublicEvent & {
+    type: "human_interaction_requested";
+    source: "environment";
+    interactionId: string;
+    interactionType: K;
+    request: HumanInteractionRequestMap[K];
+  };
+}[HumanInteractionType];
+
+export type HumanInteractionResolvedEvent = {
+  [K in HumanInteractionType]: BasePublicEvent & {
+    type: "human_interaction_resolved";
+    source: "user";
+    interactionId: string;
+    interactionType: K;
+    resolution:
+      | { kind: "response"; response: HumanInteractionResponseMap[K] }
+      | { kind: "cancelled"; reason: "user_interrupt" };
+  };
+}[HumanInteractionType];
+
 export type PublicEvent =
   | (BasePublicEvent & {
       type: "user_message";
@@ -50,10 +97,17 @@ export type PublicEvent =
       content: string;
       isError: boolean;
     })
-  | (BasePublicEvent & { type: "thinking_finished"; blocks: ThinkingBlock[] })
+  | (BasePublicEvent & { type: "thinking_completed"; blocks: ThinkingBlock[] })
   | (BasePublicEvent & { type: "error"; message: string })
-  | (BasePublicEvent & { type: "finished"; result: string })
+  | (BasePublicEvent & { type: "agent_completed"; result: string })
   | (BasePublicEvent & { type: "interrupted" })
+  | (BasePublicEvent & {
+      type: "tool_policy_mode_changed";
+      source: "environment";
+      mode: ToolPolicyMode;
+    })
+  | HumanInteractionRequestedEvent
+  | HumanInteractionResolvedEvent
   | (BasePublicEvent & {
       type: "compaction_started";
       compactionId: string;
@@ -84,6 +138,7 @@ export type PublicStreamItem = PublicEvent | { delta: Delta };
 export interface CreateConversationInput {
   conversationId?: string;
   tools?: string[];
+  toolPolicy?: ConversationToolPolicyInput;
 }
 
 export interface ConversationInfo {
@@ -114,6 +169,21 @@ export interface DeleteConversationResult {
   deleted: true;
 }
 
+export interface SetToolPolicyResult {
+  mode: ToolPolicyMode;
+  changed: boolean;
+}
+
+export type RespondToInteractionInput<K extends HumanInteractionType> = {
+  interactionType: K;
+  response: HumanInteractionResponseMap[K];
+};
+
+export interface RespondToInteractionResult {
+  interactionId: string;
+  resolved: true;
+}
+
 export type TinyhandsErrorCode =
   | "invalid_argument"
   | "conversation_exists"
@@ -121,6 +191,9 @@ export type TinyhandsErrorCode =
   | "conversation_deleted"
   | "conversation_closing"
   | "conversation_recovery_failed"
+  | "conversation_waiting_for_interaction"
+  | "interaction_not_found"
+  | "interaction_conflict"
   | "persistence_failed"
   | "runtime_cleanup_failed"
   | "event_stream_overflow"
@@ -158,6 +231,8 @@ export type TinyhandsAction =
   | "conversation:read"
   | "conversation:send"
   | "conversation:interrupt"
+  | "conversation:set_tool_policy"
+  | "conversation:respond_interaction"
   | "conversation:delete";
 
 export function isPublicStreamItem(value: unknown): value is PublicStreamItem {
@@ -175,7 +250,14 @@ export function isPublicStreamItem(value: unknown): value is PublicStreamItem {
   return (
     typeof value.type === "string" &&
     PUBLIC_EVENT_TYPES.has(value.type as PublicEvent["type"]) &&
-    !(value.type === "agent_message" && "providerReplay" in value) &&
+    !(
+      value.type === "agent_message" &&
+      ("providerReplay" in value || "executionTrace" in value)
+    ) &&
+    !(
+      value.type === "human_interaction_requested" &&
+      "continuation" in value
+    ) &&
     typeof value.id === "string" &&
     Number.isSafeInteger(value.seq) &&
     typeof value.timestamp === "number" &&
@@ -199,10 +281,13 @@ const PUBLIC_EVENT_TYPES = new Set<PublicEvent["type"]>([
   "user_message",
   "agent_message",
   "tool_result",
-  "thinking_finished",
+  "thinking_completed",
   "error",
-  "finished",
+  "agent_completed",
   "interrupted",
+  "tool_policy_mode_changed",
+  "human_interaction_requested",
+  "human_interaction_resolved",
   "compaction_started",
   "compaction_completed",
   "compaction_cancelled",
@@ -216,6 +301,9 @@ const TINYHANDS_ERROR_CODES = new Set<TinyhandsErrorCode>([
   "conversation_deleted",
   "conversation_closing",
   "conversation_recovery_failed",
+  "conversation_waiting_for_interaction",
+  "interaction_not_found",
+  "interaction_conflict",
   "persistence_failed",
   "runtime_cleanup_failed",
   "event_stream_overflow",

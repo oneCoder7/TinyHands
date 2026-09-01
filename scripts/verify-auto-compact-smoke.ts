@@ -100,7 +100,8 @@ async function main(): Promise<void> {
       llm,
       journal,
       config.llm.autoCompact,
-      config.llm.maxTokens
+      config.llm.maxTokens,
+      conversation
     );
 
     // 第一次在真实摘要请求期间中断。
@@ -113,7 +114,7 @@ async function main(): Promise<void> {
     conversation.subscribe(interruptOnStart);
     let interrupted = false;
     try {
-      await compactor.prepare(conversation, before, [], {
+      await compactor.prepare(before, [], {
         runId: "compact-run-interrupted",
         step: 0,
         signal: controller.signal,
@@ -131,7 +132,9 @@ async function main(): Promise<void> {
       "中断后缺少 compaction_cancelled"
     );
     invariant(
-      !afterInterrupt.some((event) => event.type === "compacted"),
+      !afterInterrupt.some(
+        (event) => event.type === "compaction_completed" && "summary" in event
+      ),
       "中断后不应提交 checkpoint"
     );
     invariant(
@@ -141,7 +144,7 @@ async function main(): Promise<void> {
           (record) =>
             record.type === "llm_failed" &&
             record.purpose === "compaction" &&
-            record.outcome === "aborted"
+            record.reason === "aborted"
         ),
       "Run Log 缺少 compaction llm_failed(aborted)"
     );
@@ -155,7 +158,7 @@ async function main(): Promise<void> {
       text: retryQuery,
     });
     const retryEvents = conversation.getEvents();
-    const prepared = await compactor.prepare(conversation, retryEvents, [], {
+    const prepared = await compactor.prepare(retryEvents, [], {
       runId: "compact-run-retry",
       step: 0,
     });
@@ -178,7 +181,9 @@ async function main(): Promise<void> {
       "重试必须生成新的 compactionId"
     );
     invariant(
-      committedEvents.some((event) => event.type === "compacted"),
+      committedEvents.some(
+        (event) => event.type === "compaction_completed" && "summary" in event
+      ),
       "重试后缺少内部 checkpoint"
     );
     invariant(
@@ -191,7 +196,7 @@ async function main(): Promise<void> {
         .some(
           (record) =>
             record.type === "llm_disposition" &&
-            record.outcome === "committed" &&
+            record.disposition === "committed" &&
             record.compactionId !== undefined
         ),
       "Run Log 缺少已提交的 compaction disposition"
@@ -214,7 +219,7 @@ async function main(): Promise<void> {
       "恢复投影丢失最新 query"
     );
     invariant(
-      resumed.getPublicEvents().every((event) => String(event.type) !== "compacted"),
+      !JSON.stringify(resumed.getPublicEvents()).includes('"summary"'),
       "Public View 泄露了内部 checkpoint"
     );
     invariant(

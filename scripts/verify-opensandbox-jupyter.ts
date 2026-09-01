@@ -24,7 +24,7 @@ async function main() {
   });
 
   line("创建沙箱");
-  await rt.create();
+  await rt.start();
   console.log("✅ 沙箱已就绪");
 
   // ⚠️ 本地 docker runtime 缺口:execd bootstrap 顶替了镜像 entrypoint,
@@ -126,7 +126,7 @@ async function main() {
     process.exitCode = fail > 0 ? 1 : 0;
   } finally {
     line("销毁沙箱");
-    await rt.kill();
+    await rt.close();
     console.log("✅ 已销毁");
   }
 }

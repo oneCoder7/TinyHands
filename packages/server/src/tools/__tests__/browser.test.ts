@@ -10,8 +10,8 @@ function mockRuntime(
   return {
     runtime: {
       runBrowser: async () => result,
-      create: async () => {},
-      kill: async () => {},
+      start: async () => {},
+      close: async () => {},
       exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
       readFile: async () => "",
       writeFile: async () => {},

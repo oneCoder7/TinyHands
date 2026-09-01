@@ -8,7 +8,7 @@ import type {
 import type { RunJournal } from "../observability/run-log.js";
 import type { Tool } from "../tools/tool.js";
 
-export interface AgentLlmCallInput {
+export interface AgentLLMCallInput {
   runId: string;
   step: number;
   projectedThroughSeq: number;
@@ -19,7 +19,7 @@ export interface AgentLlmCallInput {
   onDelta: (delta: Delta) => void;
 }
 
-export type AgentLlmCallOutcome =
+export type AgentLLMCallOutcome =
   | {
       type: "completed";
       llmCallId: string;
@@ -36,13 +36,13 @@ export type AgentLlmCallOutcome =
     };
 
 /** 记录并执行一次正常 Agent LLM 调用，不提交 Conversation 业务事件。 */
-export class AgentLlmCall {
+export class AgentLLMCall {
   constructor(
     private readonly llm: LLMClient,
     private readonly journal: RunJournal
   ) {}
 
-  async execute(input: AgentLlmCallInput): Promise<AgentLlmCallOutcome> {
+  async execute(input: AgentLLMCallInput): Promise<AgentLLMCallOutcome> {
     const llmCallId = randomUUID();
     await this.journal.append({
       type: "llm_started",
@@ -70,7 +70,7 @@ export class AgentLlmCall {
         step: input.step,
         llmCallId,
         purpose: "agent",
-        outcome: aborted ? "aborted" : "provider_error",
+        reason: aborted ? "aborted" : "provider_error",
         durationMs: Date.now() - startedAt,
         errorCode: aborted ? "llm_aborted" : "llm_provider_error",
         ...this.llm.identity,

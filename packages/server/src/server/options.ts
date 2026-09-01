@@ -1,4 +1,5 @@
 import type { TinyhandsLogger } from "../logging/logger.js";
+import type { ToolPolicyConfig } from "../tools/tool-policy.js";
 
 export type LLMProvider = "anthropic" | "openai";
 export type OpenAIApiMode = "responses" | "chat_completions";
@@ -47,6 +48,8 @@ export interface TinyhandsHostOptions {
   llm: LLMConfig;
   maxStep: number;
   runtime: TinyhandsRuntimeConfig;
+  /** Tool 权限能力与新 Conversation 的一次性默认 mode。 */
+  toolPolicy?: ToolPolicyConfig;
   /** 省略时使用无输出 logger；Server 不读取 LOG_* 环境变量。 */
   logger?: TinyhandsLogger;
 }

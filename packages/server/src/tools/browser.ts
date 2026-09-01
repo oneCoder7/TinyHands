@@ -11,22 +11,22 @@ import type { ToolOutput } from "../llm/types.js";
  * 脚本在 Playwright 环境中运行,page 对象已就绪。
  * 可用于网页抓取、表单填写、截图、UI 测试等。
  */
-const BrowserArgs = z.object({
+export const BrowserArgsSchema = z.object({
   script: z
     .string()
     .describe("Playwright 脚本(JavaScript)。page 对象已就绪,可直接使用。"),
 });
 
-type BrowserArgsT = z.infer<typeof BrowserArgs>;
+export type BrowserArgs = z.infer<typeof BrowserArgsSchema>;
 
-export const browserTool: Tool<BrowserArgsT> = {
+export const browserTool: Tool<BrowserArgs> = {
   name: "browser",
   description:
     "在浏览器中执行 Playwright 脚本。可用于网页抓取、表单填写、截图、UI 测试等。" +
     "脚本在 Playwright 环境中运行,page 对象已就绪。",
-  schema: BrowserArgs,
+  schema: BrowserArgsSchema,
 
-  async execute(args: BrowserArgsT, ctx: ToolContext): Promise<ToolOutput> {
+  async execute(args: BrowserArgs, ctx: ToolContext): Promise<ToolOutput> {
     const result = await ctx.runtime.runBrowser(args.script);
 
     const parts: string[] = [];

@@ -2,7 +2,10 @@ import type { LLMClient } from "../llm/llm-client.js";
 import { randomUUID } from "node:crypto";
 import { Conversation } from "../conversation/conversation.js";
 import type { Event } from "../conversation/events.js";
-import { findUnmatchedToolCalls } from "../conversation/events.js";
+import {
+  findPendingHumanInteraction,
+  type HumanInteractionRequested,
+} from "../conversation/events.js";
 import type {
   ConversationRecord,
   ConversationStore,
@@ -23,7 +26,10 @@ import type {
   TinyhandsRuntimeConfig,
 } from "./options.js";
 import { ContextCompactor } from "../agent/context-compactor.js";
+import { createBuiltInAgentLifecycle } from "../agent/agent-lifecycle.js";
 import type { Runtime } from "../runtime/runtime.js";
+import type { ToolPolicyGetter } from "../tools/tool-policy.js";
+import { HumanInteractionCoordinator } from "./human-interaction.js";
 import {
   noopLogger,
   type TinyhandsLogger,
@@ -104,12 +110,41 @@ export class AgentSession {
     return stateOf(this).runtimeStarted;
   }
 
+  get waitingForInteraction(): boolean {
+    return !!findPendingHumanInteraction(this.conversation.getEvents());
+  }
+
   submit(text: string): Promise<SubmitResult> {
     return submitUserMessage(this, text);
   }
 
   interrupt(): Promise<boolean> {
     return interruptRun(this);
+  }
+
+  resumeInteraction(request: HumanInteractionRequested): Promise<void> {
+    const agentMessage = findAgentMessageForToolCall(
+      this.conversation.getEvents(),
+      request.request.target.toolCallId
+    );
+    if (!agentMessage) {
+      return this.conversation.emit({
+        type: "error",
+        source: "agent",
+        message: "interaction 缺少对应 agent_message",
+      }).then(() => {});
+    }
+    return startContinuation(this, agentMessage);
+  }
+
+  resumeAgentMessage(
+    agentMessage: Extract<Event, { type: "agent_message" }>
+  ): Promise<void> {
+    return startContinuation(this, agentMessage);
+  }
+
+  recoverOpenRuns(protectedRunIds?: ReadonlySet<string>): Promise<void> {
+    return stateOf(this).journal.recoverOpenRuns(protectedRunIds);
   }
 
   close(): Promise<void> {
@@ -130,7 +165,7 @@ function stateOf(session: AgentSession): AgentSessionState {
  *
  * initialEvents:恢复(resume)场景由 Service 从 ConversationStore load 后传入,灌进 EventStream
  * 续接历史;新建会话不传。工厂返回 Promise 仅因内部有异步装配余地,不再在此 create runtime
- * (runtime 已惰性化,首次运行才起)。
+ * (runtime 已惰性化,首次执行或恢复 continuation 时才起)。
  */
 export type SessionFactory = (opts: {
   conversationId: string;
@@ -157,6 +192,7 @@ export function makeAgentSessionFactory(deps: {
   conversationStore: ConversationStore;
   /** 执行追踪持久化:每会话 run_log.jsonl。 */
   runLogStore: RunLogStore;
+  toolPolicyGetter?: ToolPolicyGetter;
   autoCompact?: {
     config: AutoCompactConfig;
     maxOutputTokens: number;
@@ -188,20 +224,27 @@ export function makeAgentSessionFactory(deps: {
     }
 
     const journal = await RunJournal.open(conversationId, deps.runLogStore);
-    await journal.recoverOpenRuns();
+    // Conversation 先于生命周期组件创建，使 Auto Compact 的持久化能力只在内置
+    // Context Preparation Provider 内部持有，不泄露给通用 Hook 输入。
+    const conversation = new Conversation(conversationId, {
+      store: deps.conversationStore,
+      initialEvents,
+      logger: deps.logger,
+    });
+    const compactor = deps.autoCompact
+      ? new ContextCompactor(
+          deps.llm,
+          journal,
+          deps.autoCompact.config,
+          deps.autoCompact.maxOutputTokens,
+          conversation
+        )
+      : undefined;
     const agent = new Agent(deps.llm, registry, {
       maxStep: deps.maxStep,
       journal,
-      ...(deps.autoCompact
-        ? {
-            compactor: new ContextCompactor(
-              deps.llm,
-              journal,
-              deps.autoCompact.config,
-              deps.autoCompact.maxOutputTokens
-            ),
-          }
-        : {}),
+      lifecycle: createBuiltInAgentLifecycle({ compactor }),
+      toolPolicyGetter: deps.toolPolicyGetter,
     });
 
     // ② 按配置选择执行环境——这里是唯一的 runtime 分叉点。
@@ -232,12 +275,6 @@ export function makeAgentSessionFactory(deps: {
       }
     })();
 
-    // Conversation 接 Store 的事件追加端口:emit 落盘;initialEvents 灌入恢复历史。
-    const conversation = new Conversation(conversationId, {
-      store: deps.conversationStore,
-      initialEvents,
-      logger: deps.logger,
-    });
     return new AgentSession({
       conversationId,
       conversation,
@@ -259,7 +296,7 @@ export function makeAgentSessionFactory(deps: {
 async function ensureRuntimeReady(session: AgentSession): Promise<void> {
   const state = stateOf(session);
   if (state.runtimeStarted) return;
-  await state.runtime.create();
+  await state.runtime.start();
   state.runtimeStarted = true;
 }
 
@@ -283,6 +320,9 @@ async function submitUserMessage(
 ): Promise<SubmitResult> {
   const state = stateOf(session);
   if (state.closing) throw new Error("AgentSession 正在关闭");
+  if (session.waitingForInteraction) {
+    throw new ConversationWaitingForInteractionError(session.conversationId);
+  }
   const triggerId = randomUUID();
   // ① 用户消息入事件流(await 落盘成功后才广播给所有订阅者)
   const event = await session.conversation.emit({
@@ -323,6 +363,26 @@ async function submitUserMessage(
 async function interruptRun(session: AgentSession): Promise<boolean> {
   const state = stateOf(session);
   if (state.closing) return false;
+  const pending = findPendingHumanInteraction(session.conversation.getEvents());
+  if (pending && !state.running) {
+    const event = await session.conversation.emit({
+      type: "interrupted",
+      source: "user",
+    });
+    state.lastInterruptSeq = event.seq;
+    await new HumanInteractionCoordinator().cancelPending(session.conversation);
+    const agentMessage = findAgentMessageForToolCall(
+      session.conversation.getEvents(),
+      pending.request.target.toolCallId
+    );
+    if (!agentMessage) throw new Error("interaction 缺少对应 agent_message");
+    const driver = startContinuation(session, agentMessage, true);
+    state.drivePromise = driver;
+    void driver.finally(() => {
+      if (state.drivePromise === driver) state.drivePromise = null;
+    });
+    return true;
+  }
   if (!state.running || !state.runAbort) return false; // 空闲:无事可断
   if (state.runAbort.signal.aborted) return false; // 已在打断中:去重
   // 先留痕再拉闸:interrupted 先入流,订阅者先看到「用户打断了」,
@@ -389,6 +449,13 @@ async function driveRun(session: AgentSession): Promise<void> {
       }
 
       try {
+        if (r.status === "suspended") {
+          state.log.info(
+            { conversationId: session.conversationId, runId },
+            "agent.run 等待 human interaction"
+          );
+          break;
+        }
         const errorCode = runErrorCode(r.status);
         await journal.append({
           type: "run_completed",
@@ -467,6 +534,76 @@ async function driveRun(session: AgentSession): Promise<void> {
   }
 }
 
+/** 解决 interaction 后，从 Conversation Event 中的坐标恢复原 run/step。 */
+function startContinuation(
+  session: AgentSession,
+  agentMessage: Extract<Event, { type: "agent_message" }>,
+  abortImmediately = false
+): Promise<void> {
+  const state = stateOf(session);
+  if (state.running) return state.drivePromise ?? Promise.resolve();
+  const driver = (async () => {
+    state.running = true;
+    const runId = agentMessage.executionTrace?.runId;
+    try {
+      if (!runId) throw new Error("agent_message 缺少恢复坐标");
+      await ensureRuntimeReady(session);
+      state.runAbort = new AbortController();
+      if (abortImmediately) state.runAbort.abort();
+      const result = await state.agent.resume(session.conversation, {
+        runId,
+        runtime: state.runtime,
+        signal: state.runAbort.signal,
+        agentMessage,
+      });
+      if (result.status === "suspended") return;
+      await state.journal.append({
+        type: "run_completed",
+        runId,
+        status: result.status,
+        projectedThroughSeq: result.projectedThroughSeq,
+        durationMs: 0,
+        ...(runErrorCode(result.status)
+          ? { errorCode: runErrorCode(result.status) }
+          : {}),
+      });
+    } catch (err) {
+      try {
+        await session.conversation.emit({
+          type: "error",
+          source: "agent",
+          message: `恢复运行出错：${err instanceof Error ? err.message : String(err)}`,
+        });
+      } catch {
+        // Conversation 落盘错误由服务端日志兜底。
+      }
+      state.log.error(
+        { conversationId: session.conversationId, runId, err },
+        "interaction continuation 异常"
+      );
+    } finally {
+      state.running = false;
+      state.runAbort = null;
+    }
+  })();
+  state.drivePromise = driver;
+  void driver.finally(() => {
+    if (state.drivePromise === driver) state.drivePromise = null;
+  });
+  return driver;
+}
+
+function findAgentMessageForToolCall(
+  events: readonly Event[],
+  toolCallId: string
+): Extract<Event, { type: "agent_message" }> | undefined {
+  return [...events].reverse().find(
+    (event): event is Extract<Event, { type: "agent_message" }> =>
+      event.type === "agent_message" &&
+      event.toolCalls.some((call) => call.id === toolCallId)
+  );
+}
+
 /**
  * 让 Session 静止并释放 Runtime，但不删除 Conversation 数据。
  * delete 与未来 Host.close 共用这一条关闭路径。
@@ -478,7 +615,7 @@ function closeAgentSession(session: AgentSession): Promise<void> {
   state.runAbort?.abort();
   const close = (async () => {
     await state.drivePromise;
-    await state.runtime.kill();
+    await state.runtime.close();
   })();
   state.closePromise = close;
   void close.then(undefined, () => {
@@ -494,6 +631,12 @@ function runErrorCode(status: RunStatus): string | undefined {
   return undefined;
 }
 
+export class ConversationWaitingForInteractionError extends Error {
+  constructor(conversationId: string) {
+    super(`conversation 正在等待 human interaction：${conversationId}`);
+  }
+}
+
 function projectedThroughForRun(journal: RunJournal, runId: string): number {
   for (const record of journal.getRecords().reverse()) {
     if (record.type === "step_started" && record.runId === runId) {
@@ -505,9 +648,8 @@ function projectedThroughForRun(journal: RunJournal, runId: string): number {
 
 /**
  * 水位线之后是否有未被本次 run 看过的用户消息。
- * 无需区分消息来源:agent 自产的引导 user_message(纯文字轮/finish 参数错)
- * emit 后必然 continue → 被下一次投影覆盖,故 completed 的最终水位线之后
- * 不可能残留 agent 自产消息,查 type 即可。
+ * `user_message` 只表示真实用户输入；Loop 注入使用不可公开的 context_message，
+ * 不参与 lost-wakeup 判断。
  */
 function hasUnseenUserMessage(session: AgentSession, watermark: number): boolean {
   return session.conversation

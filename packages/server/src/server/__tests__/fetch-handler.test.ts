@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import type { PublicStreamItem } from "@tinyhands/protocol";
 import {
   ConversationExistsError,
+  ConversationWaitingForInteractionError,
   type EventSubscription,
 } from "../conversation-service.js";
 import { createTinyhandsFetchHandler } from "../fetch-handler.js";
@@ -43,6 +44,11 @@ function fakeHost(overrides: Record<string, unknown> = {}) {
         triggerId: "trigger-1",
       })),
       interrupt: vi.fn(async () => ({ interrupted: true })),
+      setToolPolicy: vi.fn(async () => ({ mode: "default", changed: true })),
+      respondToInteraction: vi.fn(async (_conversationId, interactionId) => ({
+        interactionId,
+        resolved: true as const,
+      })),
       events: vi.fn(async () => subscription([], undefined)),
       ...overrides,
     },
@@ -100,6 +106,24 @@ describe("Tinyhands Fetch handler", () => {
     });
   });
 
+  it("等待 interaction 时 send 返回稳定 409", async () => {
+    const handle = createTinyhandsFetchHandler({
+      host: fakeHost({
+        send: vi.fn(async () => {
+          throw new ConversationWaitingForInteractionError("c1");
+        }),
+      }),
+    });
+    const response = await handle(new Request(
+      "http://tinyhands.test/v1/conversations/c1/messages",
+      { method: "POST", body: JSON.stringify({ text: "later" }) }
+    ));
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({
+      error: { code: "conversation_waiting_for_interaction" },
+    });
+  });
+
   it("SSE 使用 Last-Event-ID，持久事件带 id，Delta 不带 id，并发送终态控制帧", async () => {
     const event: PublicStreamItem = {
       id: "evt-2",
@@ -132,5 +156,27 @@ describe("Tinyhands Fetch handler", () => {
     expect(body).toContain(`data: ${JSON.stringify(delta)}\n\n`);
     expect(body).toContain("event: tinyhands.control");
     expect(body).toContain('"code":"conversation_deleted"');
+  });
+
+  it("支持切换 Tool Policy 与响应通用 interaction", async () => {
+    const host = fakeHost();
+    const handle = createTinyhandsFetchHandler({ host });
+    expect((await handle(new Request(
+      "http://tinyhands.test/v1/conversations/c1/tool-policy",
+      { method: "PUT", body: JSON.stringify({ mode: "full_access" }) }
+    ))).status).toBe(200);
+
+    const response = await handle(new Request(
+      "http://tinyhands.test/v1/conversations/c1/interactions/i1/respond",
+      {
+        method: "POST",
+        body: JSON.stringify({
+          interactionType: "approval",
+          response: { decision: "approve" },
+        }),
+      }
+    ));
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ interactionId: "i1", resolved: true });
   });
 });

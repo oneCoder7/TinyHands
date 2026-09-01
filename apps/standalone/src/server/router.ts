@@ -4,6 +4,9 @@ import {
   ConversationExistsError,
   ConversationNotFoundError,
   InvalidConversationInputError,
+  ConversationWaitingForInteractionError,
+  InteractionConflictError,
+  InteractionNotFoundError,
   type ConversationService,
 } from "@tinyhands/server";
 
@@ -34,10 +37,28 @@ const CreateBody = z.object({
    * 无需也无法通过此字段控制。不传时默认只启用 run_bash(向后兼容)。
    */
   tools: z.array(z.string()).optional(),
+  toolPolicy: z
+    .object({
+      mode: z.enum(["request_approval", "default", "full_access"]),
+    })
+    .optional(),
 });
 const DeleteBody = z.object({ conversationId: ConvId });
 const SendBody = z.object({ conversationId: ConvId, text: z.string().min(1) });
 const InterruptBody = z.object({ conversationId: ConvId });
+const ToolPolicyBody = z.object({
+  conversationId: ConvId,
+  mode: z.enum(["request_approval", "default", "full_access"]),
+});
+const InteractionResponseBody = z.object({
+  conversationId: ConvId,
+  interactionId: z.string().min(1),
+  interactionType: z.literal("approval"),
+  response: z.object({
+    decision: z.enum(["approve", "reject"]),
+    reason: z.string().optional(),
+  }),
+});
 
 export function registerRoutes(
   fastify: FastifyInstance,
@@ -56,12 +77,13 @@ export function registerRoutes(
       return { error: "参数不合法：conversationId 须为非空字符串" };
     }
 
-    const { tools } = parsed.data;
+    const { tools, toolPolicy } = parsed.data;
     // id 冲突/工具非法由 Service 抛类型化错误，server error handler 统一映射。
     const created = await callService(reply, () =>
       manager.create({
         conversationId: parsed.data.conversationId,
         tools,
+        toolPolicy,
       })
     );
     if ("error" in created) return created;
@@ -105,6 +127,37 @@ export function registerRoutes(
     }
     return callService(reply, () => manager.interrupt(parsed.data.conversationId));
   });
+
+  fastify.post("/conversations/tool-policy", async (req, reply) => {
+    const parsed = ToolPolicyBody.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      reply.code(400);
+      return { error: "参数不合法：需要 conversationId 与合法 mode" };
+    }
+    return callService(reply, () =>
+      manager.setToolPolicy(parsed.data.conversationId, {
+        mode: parsed.data.mode,
+      })
+    );
+  });
+
+  fastify.post("/conversations/interactions/respond", async (req, reply) => {
+    const parsed = InteractionResponseBody.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      reply.code(400);
+      return { error: "approval response 格式不合法" };
+    }
+    return callService(reply, () =>
+      manager.respondToInteraction(
+        parsed.data.conversationId,
+        parsed.data.interactionId,
+        {
+          interactionType: parsed.data.interactionType,
+          response: parsed.data.response,
+        }
+      )
+    );
+  });
 }
 
 async function callService<T>(
@@ -124,6 +177,17 @@ async function callService<T>(
     }
     if (err instanceof ConversationExistsError) {
       reply.code(409);
+      return { error: err.message };
+    }
+    if (
+      err instanceof ConversationWaitingForInteractionError ||
+      err instanceof InteractionConflictError
+    ) {
+      reply.code(409);
+      return { error: err.message };
+    }
+    if (err instanceof InteractionNotFoundError) {
+      reply.code(404);
       return { error: err.message };
     }
     throw err;

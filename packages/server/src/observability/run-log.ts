@@ -7,7 +7,7 @@ const Duration = z.number().finite().nonnegative();
 const NonEmptyString = z.string().min(1);
 
 const base = {
-  version: z.literal(1),
+  version: z.literal(2),
   seq: PositiveSafeInt,
   timestamp: SafeInt,
   conversationId: NonEmptyString,
@@ -29,7 +29,7 @@ const usage = z.strictObject({
 });
 
 /** Run Log 一行记录的运行时 schema，也是静态类型的唯一来源。 */
-export const RunLogRecordSchema = z
+const CanonicalRunLogRecordSchema = z
   .discriminatedUnion("type", [
     z.strictObject({ ...base, type: z.literal("run_started"), runId: NonEmptyString }),
     z.strictObject({
@@ -45,7 +45,7 @@ export const RunLogRecordSchema = z
       type: z.literal("step_completed"),
       runId: NonEmptyString,
       step: SafeInt,
-      outcome: z.enum(["continue", "finished", "error", "interrupted"]),
+      outcome: z.enum(["continue", "completed", "error", "interrupted"]),
       durationMs: Duration,
     }),
     z.strictObject({
@@ -66,7 +66,7 @@ export const RunLogRecordSchema = z
       ...base,
       type: z.literal("run_recovered"),
       runId: NonEmptyString,
-      outcome: z.literal("process_crashed"),
+      reason: z.literal("process_crashed"),
     }),
     z.strictObject({
       ...base,
@@ -101,7 +101,7 @@ export const RunLogRecordSchema = z
       step: SafeInt,
       llmCallId: NonEmptyString,
       purpose: z.enum(["agent", "compaction"]),
-      outcome: z.enum(["provider_error", "aborted"]),
+      reason: z.enum(["provider_error", "aborted"]),
       durationMs: Duration,
       errorCode: NonEmptyString.optional(),
       compactionId: NonEmptyString.optional(),
@@ -113,7 +113,7 @@ export const RunLogRecordSchema = z
       step: SafeInt,
       llmCallId: NonEmptyString,
       compactionId: NonEmptyString.optional(),
-      outcome: z.enum(["committed", "discarded", "rejected"]),
+      disposition: z.enum(["committed", "discarded", "rejected"]),
       reason: z
         .enum([
           "user_interrupt",
@@ -123,13 +123,14 @@ export const RunLogRecordSchema = z
           "invalid_summary",
           "summary_too_large",
           "persistence_error",
+          "lifecycle_error",
         ])
         .optional(),
       eventSeqs: z.array(PositiveSafeInt),
     }),
     z.strictObject({
       ...base,
-      type: z.literal("tool_started"),
+      type: z.literal("tool_call_dispatched"),
       runId: NonEmptyString,
       step: SafeInt,
       llmCallId: NonEmptyString,
@@ -138,7 +139,7 @@ export const RunLogRecordSchema = z
     }),
     z.strictObject({
       ...base,
-      type: z.literal("tool_completed"),
+      type: z.literal("tool_call_completed"),
       runId: NonEmptyString,
       step: SafeInt,
       llmCallId: NonEmptyString,
@@ -150,13 +151,23 @@ export const RunLogRecordSchema = z
     }),
     z.strictObject({
       ...base,
-      type: z.literal("tool_skipped"),
+      type: z.literal("tool_call_skipped"),
       runId: NonEmptyString,
       step: SafeInt,
       llmCallId: NonEmptyString,
       toolCallId: NonEmptyString,
       tool: NonEmptyString,
-      reason: z.enum(["user_interrupt", "finish_called"]),
+      reason: z.enum([
+        "user_interrupt",
+        "finish_called",
+        "lifecycle_error",
+        "approval_rejected",
+        "policy_denied",
+        "policy_error",
+        "process_restarted",
+        "unknown_tool",
+        "invalid_arguments",
+      ]),
       resultEventSeq: PositiveSafeInt,
     }),
   ])
@@ -206,6 +217,12 @@ export const RunLogRecordSchema = z
     }
   });
 
+/** 旧 run_log.jsonl 只读兼容；新追加始终使用 version 2。 */
+export const RunLogRecordSchema = z.preprocess(
+  normalizeLegacyRunLogRecord,
+  CanonicalRunLogRecordSchema
+);
+
 export type RunLogRecord = z.infer<typeof RunLogRecordSchema>;
 
 type DistributiveOmit<T, K extends PropertyKey> = T extends unknown
@@ -252,7 +269,7 @@ export class RunJournal {
     const task = this.appendChain.then(async () => {
       const record = RunLogRecordSchema.parse({
         ...draft,
-        version: 1,
+        version: 2,
         seq: this.records.length + 1,
         timestamp: Date.now(),
         conversationId: this.conversationId,
@@ -280,7 +297,7 @@ export class RunJournal {
   }
 
   /** 进程重启时闭合未完成的 run；只补审计事实，不自动重启执行。 */
-  async recoverOpenRuns(): Promise<void> {
+  async recoverOpenRuns(protectedRunIds: ReadonlySet<string> = new Set()): Promise<void> {
     const open = new Set<string>();
     for (const record of this.records) {
       if (record.type === "run_started") open.add(record.runId);
@@ -289,7 +306,34 @@ export class RunJournal {
       }
     }
     for (const runId of open) {
-      await this.append({ type: "run_recovered", runId, outcome: "process_crashed" });
+      if (protectedRunIds.has(runId)) continue;
+      await this.append({ type: "run_recovered", runId, reason: "process_crashed" });
     }
   }
+}
+
+function normalizeLegacyRunLogRecord(value: unknown): unknown {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
+  const record = { ...(value as Record<string, unknown>) };
+  if (record.version !== 1) return value;
+  record.version = 2;
+  if (record.type === "tool_started") record.type = "tool_call_dispatched";
+  if (record.type === "tool_completed") record.type = "tool_call_completed";
+  if (record.type === "tool_skipped") record.type = "tool_call_skipped";
+  if (record.type === "step_completed" && record.outcome === "finished") {
+    record.outcome = "completed";
+  }
+  if (record.type === "run_recovered") {
+    record.reason = record.outcome;
+    delete record.outcome;
+  }
+  if (record.type === "llm_failed") {
+    record.reason = record.outcome;
+    delete record.outcome;
+  }
+  if (record.type === "llm_disposition") {
+    record.disposition = record.outcome;
+    delete record.outcome;
+  }
+  return record;
 }

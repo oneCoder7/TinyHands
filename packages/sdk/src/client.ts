@@ -6,8 +6,13 @@ import {
   type InterruptResult,
   type PublicStreamItem,
   type SendMessageResult,
+  type ConversationToolPolicyInput,
+  type SetToolPolicyResult,
   type StreamClosedControl,
   type TinyhandsErrorCode,
+  type RespondToInteractionInput,
+  type RespondToInteractionResult,
+  type HumanInteractionType,
 } from "@tinyhands/protocol";
 
 export interface TinyhandsClientOptions {
@@ -152,6 +157,33 @@ export class ConversationHandle {
     return this.client.request(
       `/conversations/${encodeURIComponent(this.conversationId)}/interrupt`,
       { method: "POST" }
+    );
+  }
+
+  setToolPolicy(
+    policy: ConversationToolPolicyInput
+  ): Promise<SetToolPolicyResult> {
+    return this.client.request(
+      `/conversations/${encodeURIComponent(this.conversationId)}/tool-policy`,
+      {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(policy),
+      }
+    );
+  }
+
+  respondToInteraction<K extends HumanInteractionType>(
+    interactionId: string,
+    input: RespondToInteractionInput<K>
+  ): Promise<RespondToInteractionResult> {
+    return this.client.request(
+      `/conversations/${encodeURIComponent(this.conversationId)}/interactions/${encodeURIComponent(interactionId)}/respond`,
+      {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(input),
+      }
     );
   }
 

@@ -10,6 +10,7 @@ import {
 import type { EventAppender } from "../conversation-store.js";
 import type { Delta } from "../../llm/types.js";
 import type { ProviderReplayState } from "../../llm/types.js";
+import { Conversation } from "../conversation.js";
 
 /**
  * EventStream 持久化行为测试 + findUnmatchedToolCalls 恢复补偿测试。
@@ -255,6 +256,99 @@ describe("EventStream 持久化", () => {
     ]);
   });
 
+  it("context_message 持久但不公开，只投影到下一条 agent_message 提交前", async () => {
+    const store = makeMockStore();
+    const stream = new EventStream(store, "c");
+    const publicSeen: unknown[] = [];
+    stream.subscribePublic((item) => publicSeen.push(item));
+
+    await stream.emit({
+      type: "user_message",
+      source: "user",
+      text: "real user",
+    });
+    await stream.emit({
+      type: "agent_message",
+      source: "agent",
+      text: "plain response",
+      toolCalls: [],
+    });
+    await stream.emit({
+      type: "context_message",
+      source: "environment",
+      text: "loop reminder",
+    });
+
+    expect(store.appended.at(-1)).toMatchObject({
+      type: "context_message",
+      source: "environment",
+      text: "loop reminder",
+    });
+    expect(stream.getPublicEvents().map((event) => event.type)).toEqual([
+      "user_message",
+      "agent_message",
+    ]);
+    expect(JSON.stringify(publicSeen)).not.toContain("loop reminder");
+    expect(projectCompactedContext(stream.getEvents()).messages.at(-1)).toEqual(
+      { role: "user", text: "loop reminder" }
+    );
+
+    await stream.emit({
+      type: "agent_message",
+      source: "agent",
+      text: "next response",
+      toolCalls: [],
+    });
+    expect(
+      projectCompactedContext(stream.getEvents()).messages.some(
+        (message) => message.text === "loop reminder"
+      )
+    ).toBe(false);
+    expect(stream.getEvents().some((event) => event.type === "context_message"))
+      .toBe(true);
+  });
+
+  it("context_message 在 checkpoint 之后附加，不进入压缩摘要", async () => {
+    const stream = new EventStream();
+    await stream.emit({ type: "user_message", source: "user", text: "old" });
+    await stream.emit({
+      type: "agent_message",
+      source: "agent",
+      text: "answer",
+      toolCalls: [],
+    });
+    await stream.emit({
+      type: "context_message",
+      source: "environment",
+      text: "one-shot",
+    });
+    await stream.emit({
+      type: "compacted",
+      source: "agent",
+      compactionId: "cmp-context",
+      throughSeq: 3,
+      summaryVersion: 1,
+      summary: {
+        objective: "summary objective",
+        confirmedDecisions: [],
+        constraints: [],
+        completedWork: [],
+        currentState: [],
+        importantArtifacts: [],
+        unresolvedIssues: [],
+        nextActions: [],
+      },
+      provider: "test",
+      model: "model",
+      estimatedBeforeTokens: 100,
+      estimatedAfterTokens: 40,
+    });
+
+    const projected = projectCompactedContext(stream.getEvents());
+    expect(projected.messages).toEqual([{ role: "user", text: "one-shot" }]);
+    expect(projected.systemContext[0]).not.toContain("one-shot");
+  });
+
   it("上下文投影只应用最新 checkpoint，并保留其后的原始 tail", async () => {
     const stream = new EventStream();
     await stream.emit({ type: "user_message", source: "user", text: "old" });
@@ -430,5 +524,50 @@ describe("findUnmatchedToolCalls — 恢复时的孤儿补偿", () => {
       },
     ];
     expect(findUnmatchedToolCalls(events).length).toBe(1);
+  });
+
+  it("Human Interaction 公开但裁剪 continuation，dispatch 与恢复坐标不公开", async () => {
+    const conversation = new Conversation("public-hil");
+    await conversation.emit({
+      type: "agent_message",
+      source: "agent",
+      text: "",
+      toolCalls: [tc("t1")],
+      executionTrace: {
+        runId: "r1",
+        step: 0,
+        llmCallId: "l1",
+        projectedThroughSeq: 1,
+      },
+    });
+    await conversation.emit({
+      type: "human_interaction_requested",
+      source: "environment",
+      interactionId: "i1",
+      interactionType: "approval",
+      request: {
+        target: { type: "tool_call", toolCallId: "t1" },
+        reason: "approve",
+      },
+      continuation: {
+        runId: "r1",
+        step: 0,
+        llmCallId: "l1",
+        projectedThroughSeq: 1,
+      },
+    });
+    await conversation.emit({
+      type: "tool_call_dispatched",
+      source: "environment",
+      toolCallId: "t1",
+    });
+
+    const publicEvents = conversation.getPublicEvents();
+    expect(publicEvents.map((event) => event.type)).toEqual([
+      "agent_message",
+      "human_interaction_requested",
+    ]);
+    expect(JSON.stringify(publicEvents)).not.toContain("executionTrace");
+    expect(JSON.stringify(publicEvents)).not.toContain("continuation");
   });
 });

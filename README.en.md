@@ -31,6 +31,8 @@ session management + live streaming.
 - **Persistent execution tracing** — every HTTP trigger, Agent run, LLM call, and Tool execution is linked by stable IDs for post-restart inspection.
 - **Cooperative interrupt** — a run can be interrupted at any time; the agent stops cleanly at a checkpoint, leaving no half state.
 - **Automatic context compaction** — enabled by default with a 20k context window; creates recoverable checkpoints without deleting original events.
+- **Per-conversation tool policy** — built-in `request_approval`, `default`, and `full_access` modes, with an optional Host business-policy override.
+- **Durable human approval** — risky calls suspend the original run and resume its step after approval or rejection, including across process restarts.
 - **Streaming output** — token-level streaming, including live extended-thinking traces.
 
 ## Quick start
@@ -52,7 +54,7 @@ round-trip:
 # 1) create a conversation, enabling the shell and code-execution tools
 curl -XPOST localhost:8787/v1/conversations \
   -H 'content-type: application/json' \
-  -d '{"conversationId":"demo","tools":["run_bash","run_code"]}'
+  -d '{"conversationId":"demo","tools":["run_bash","run_code"],"toolPolicy":{"mode":"full_access"}}'
 
 # 2) subscribe to its event stream (in another terminal, keep it open)
 curl -N localhost:8787/v1/conversations/demo/events
@@ -112,6 +114,7 @@ const host = await createTinyhandsHost({
     },
   },
   runtime: { type: "local" },
+  toolPolicy: { defaultMode: "default" },
 });
 
 // Call the application port directly.
@@ -136,8 +139,9 @@ silent Server library.
 ### 1. Create a conversation
 
 `POST /v1/conversations`, optionally with `conversationId` (auto-generated
-if omitted) and `tools` (the optional tools to enable). Each conversation gets
-its own workspace and execution environment.
+if omitted), `tools` (the optional tools to enable), and `toolPolicy: { mode }`.
+If mode is omitted, the Host default is copied and persisted once; later Host
+default changes do not mutate existing conversations.
 
 ### 2. Subscribe to the event stream
 
@@ -156,12 +160,15 @@ Subscribers receive these events (each carries a monotonic `seq`):
 | Event type          | Meaning                                            |
 | ------------------- | -------------------------------------------------- |
 | `user_message`      | a user message (echoed to all viewers)             |
-| `thinking_finished` | a finalized thinking block (extended thinking)     |
+| `thinking_completed` | a finalized thinking block (extended thinking)    |
 | `agent_message`     | the agent's message + the tool calls it issued     |
 | `tool_result`       | the result of one tool call                        |
-| `finished`          | task complete (the agent called `finish`)          |
+| `agent_completed`   | task complete (the agent called `finish`)          |
 | `interrupted`       | the run was interrupted                            |
 | `error`             | the run errored                                    |
+| `tool_policy_mode_changed` | the conversation policy was initialized or changed |
+| `human_interaction_requested` | the Agent is waiting for an approval       |
+| `human_interaction_resolved` | an approval was accepted, rejected, or cancelled |
 | `compaction_started` | context compaction started and can be interrupted |
 | `compaction_completed` | the compaction checkpoint was committed         |
 | `compaction_cancelled` | compaction was cancelled by an interrupt or restart |
@@ -169,7 +176,9 @@ Subscribers receive these events (each carries a monotonic `seq`):
 
 Plus the transient `delta` (streaming tokens / thinking chunks) — broadcast
 only, never stored in history.
-The internal `compacted` checkpoint is persisted but never exposed over WS/SSE.
+Internal `context_message`, `tool_call_dispatched`, and recovery coordinates are
+persisted but never exposed through SSE or the SDK. Private summary fields live
+on `compaction_completed`; its public view contains only stable metadata.
 
 ### 3. Send / interrupt
 
@@ -194,7 +203,17 @@ conversation's `run_log.jsonl`.
 
 Full endpoints under [HTTP API](#http-api).
 
-### 4. Persistent data
+### 4. Tool policy and human approval
+
+`default` directly allows `read_file` and asks for other controlled tools;
+`request_approval` asks for every controlled tool; `full_access` allows them.
+`finish` is an Agent Loop completion protocol and bypasses Tool Policy. While a
+request is pending, new messages return `409 conversation_waiting_for_interaction`.
+Respond with `POST /v1/conversations/:id/interactions/:interactionId/respond`.
+A rejection creates an error `tool_result` with the original `toolCallId`, then
+continues the remaining calls in the same model response.
+
+### 5. Persistent data
 
 Conversation data is stored under `~/workspace/<conversationId>/` by default.
 Development and test environments can use `TINYHANDS_HOME` to override `~`:
@@ -211,6 +230,8 @@ Development and test environments can use `TINYHANDS_HOME` to override `~`:
 - `run_log.jsonl` stores run, step, LLM, and Tool lifecycles, durations, and
   provider-reported token usage. It does not duplicate prompts, responses, Tool
   arguments, or Tool result bodies.
+- Messages, approvals, and Tool pairing are recovered only from `events.jsonl`;
+  Run Log is never a Conversation recovery source.
 - Deleting a conversation deletes its entire directory.
 
 Tinyhands does not expose `/stats`, `/metrics`, or a Run Log query API. Inspect
@@ -263,7 +284,7 @@ export const myTool: Tool<MyArgs> = {
 ```
 
 **Swap the execution environment.** Implement the `Runtime` interface (`exec` /
-`readFile` / `writeFile` / `runCode` / `runBrowser` + `create`/`kill`
+`readFile` / `writeFile` / `runCode` / `runBrowser` + `start`/`close`
 lifecycle) to plug in any sandbox backend. The built-in `Local` / `Docker` /
 `OpenSandbox` implementations are direct references.
 
@@ -292,6 +313,8 @@ New integrations use the versioned `/v1` REST + SSE API:
 | DELETE | `/v1/conversations/:conversationId`            | delete a conversation         |
 | POST   | `/v1/conversations/:conversationId/messages`   | submit a user message         |
 | POST   | `/v1/conversations/:conversationId/interrupt`  | cooperatively interrupt a run |
+| PUT    | `/v1/conversations/:conversationId/tool-policy` | switch the policy mode       |
+| POST   | `/v1/conversations/:conversationId/interactions/:interactionId/respond` | respond to an interaction |
 | GET    | `/v1/conversations/:conversationId/events`     | SSE downlink event stream     |
 
 `/v1` errors use `{ "error": { "code", "message" } }`. SSE supports

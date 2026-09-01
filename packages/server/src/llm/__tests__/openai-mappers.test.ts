@@ -88,7 +88,7 @@ describe("OpenAI Responses mapper", () => {
     );
 
     expect(mapped).toMatchObject({
-      stopReason: "tool_use",
+      stopReason: "tool_call",
       text: "working",
       toolCalls: [
         { id: "call-1", name: "finish", args: { result: "done" } },
@@ -297,7 +297,7 @@ describe("OpenAI Chat mapper", () => {
         })
       )
     ).toMatchObject({
-      stopReason: "tool_use",
+      stopReason: "tool_call",
       toolCalls: [{ id: "call-1", args: { result: "ok" } }],
     });
 

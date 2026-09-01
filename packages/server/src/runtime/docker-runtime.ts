@@ -50,7 +50,7 @@ export class DockerRuntime implements Runtime {
    * HostPort:0 → Docker 自动分配宿主端口,避免多会话端口冲突。文件全在容器内,
    * 不做 bind mount。
    */
-  async create(): Promise<void> {
+  async start(): Promise<void> {
     this.log.info(
       { conversationId: this.conversationId, image: this.image },
       "正在创建 sandbox 容器"
@@ -204,7 +204,7 @@ const { chromium } = require('playwright');
    * kill = 停止 + 删除容器。幂等。
    * stop 可能因容器已停而报错(304),catch 后继续 remove。
    */
-  async kill(): Promise<void> {
+  async close(): Promise<void> {
     if (this.killed) return;
     this.killed = true;
 

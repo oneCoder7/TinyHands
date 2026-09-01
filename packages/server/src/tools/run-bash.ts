@@ -12,17 +12,17 @@ import type { ToolOutput } from "../llm/types.js";
  * 命令非 0 退出对 agent 是要喂给 LLM 的正常观察(据此决定下一步)，不是程序错误。
  *   故这里把 exitCode≠0 标成 isError 仅供展示，内容仍如实回传。
  */
-const RunBashArgs = z.object({
+export const RunBashArgsSchema = z.object({
   command: z.string().describe("要执行的 shell 命令"),
 });
 
-type RunBashArgsT = z.infer<typeof RunBashArgs>;
+export type RunBashArgs = z.infer<typeof RunBashArgsSchema>;
 
-export const runBashTool: Tool<RunBashArgsT> = {
+export const runBashTool: Tool<RunBashArgs> = {
   name: "run_bash",
   description: "执行一条 shell 命令，返回它的 stdout / stderr 输出。",
-  schema: RunBashArgs,
-  async execute(args: RunBashArgsT, ctx: ToolContext): Promise<ToolOutput> {
+  schema: RunBashArgsSchema,
+  async execute(args: RunBashArgs, ctx: ToolContext): Promise<ToolOutput> {
     const { stdout, stderr, exitCode } = await ctx.runtime.exec(args.command);
     const out = [stdout, stderr].filter(Boolean).join("\n").trim();
     if (exitCode === 0) {

@@ -127,7 +127,7 @@ export type LLMUsageReport =
  */
 export type LLMStopReason =
   | "end_turn"
-  | "tool_use"
+  | "tool_call"
   | "max_tokens"
   | "content_filter"
   | "refusal";
@@ -135,7 +135,7 @@ export type LLMStopReason =
 /**
  * LLM 的一次响应(中性)。stopReason 回答「这轮 API 为什么收笔」,与「业务任务是否
  * 完成」(finish 工具)是两个图层:
- *  - "tool_use"   有工具要执行(finish 也走这条)
+ *  - "tool_call"  有工具要执行(finish 也走这条)
  *  - "end_turn"   只回了纯文字、没调任何工具
  *  - "max_tokens" 这轮被截断 → toolCalls 可能是坏的半截,不能拿去 execute
  */
@@ -145,7 +145,7 @@ export interface LLMResponse {
   text: string;
   /** 结构化工具调用（可能为空） */
   toolCalls: ToolCall[];
-  /** 本轮的思考定稿块（含签名），Agent 拿去 emit thinking_finished。可能为空 */
+  /** 本轮的思考定稿块（含签名），Agent 拿去 emit thinking_completed。可能为空 */
   thinkingBlocks?: ThinkingBlock[];
   /** 与 canonical response 一起原子提交的内部 provider 回放状态。 */
   providerReplay?: ProviderReplayState;

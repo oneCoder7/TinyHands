@@ -24,7 +24,7 @@
  */
 export interface Runtime {
   /** 生命周期:创建执行环境。LocalRuntime 为 no-op。 */
-  create(): Promise<void>;
+  start(): Promise<void>;
   /** 执行一条 shell 命令 */
   exec(command: string, opts?: { timeoutMs?: number }): Promise<ExecResult>;
   /** 读文件(相对 runtime 的文件系统) */
@@ -46,7 +46,7 @@ export interface Runtime {
   runBrowser(script: string): Promise<BrowserResult>;
 
   /** 生命周期:销毁执行环境。LocalRuntime 为 no-op。 */
-  kill(): Promise<void>;
+  close(): Promise<void>;
 }
 
 /** exec 的结构化结果 */

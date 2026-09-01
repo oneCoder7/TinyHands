@@ -10,6 +10,7 @@ import type { RunLogStore } from "../../observability/run-log-store.js";
 import type { Runtime } from "../../runtime/runtime.js";
 import { ToolRegistry, type Tool } from "../../tools/tool.js";
 import { CompactionError } from "../context-compactor.js";
+import { createBuiltInAgentLifecycle } from "../agent-lifecycle.js";
 
 class MemoryRunLogStore implements RunLogStore {
   records: RunLogRecord[] = [];
@@ -46,7 +47,7 @@ const PROVIDER_REPLAY = {
 
 function response(overrides: Partial<LLMResponse> = {}): LLMResponse {
   return {
-    stopReason: "tool_use",
+    stopReason: "tool_call",
     text: "",
     toolCalls: [{ id: "finish-1", name: "finish", args: { result: "secret-result" } }],
     usage: REPORTED_USAGE,
@@ -86,7 +87,7 @@ describe("Agent Run Log", () => {
     const result = await new Agent(llm, new ToolRegistry(), {
       maxStep: 1,
       journal,
-      compactor,
+      lifecycle: createBuiltInAgentLifecycle({ compactor }),
     }).run(conv, runContext());
 
     expect(result).toMatchObject({
@@ -106,7 +107,7 @@ describe("Agent Run Log", () => {
     const store = new MemoryRunLogStore();
     const journal = await RunJournal.open("c1", store);
     const finishExecute = vi.fn(async () => {
-      expect(store.records.at(-1)?.type).toBe("tool_started");
+      expect(store.records.at(-1)?.type).toBe("tool_call_dispatched");
       return { content: "secret-result", isError: false };
     });
     const finish: Tool<{ result: string }> = {
@@ -169,15 +170,15 @@ describe("Agent Run Log", () => {
     });
 
     const toolCompleted = store.records.find(
-      (record) => record.type === "tool_completed"
+      (record) => record.type === "tool_call_completed"
     );
     expect(toolCompleted).toMatchObject({ outcome: "success", toolCallId: "finish-1" });
-    if (toolCompleted?.type !== "tool_completed") throw new Error("missing tool_completed");
+    if (toolCompleted?.type !== "tool_call_completed") throw new Error("missing tool_call_completed");
     expect(conv.getEvents().find((event) => event.seq === toolCompleted.resultEventSeq)).toMatchObject({
       type: "tool_result",
       toolCallId: "finish-1",
     });
-    expect(store.records.find((record) => record.type === "tool_skipped")).toMatchObject({
+    expect(store.records.find((record) => record.type === "tool_call_skipped")).toMatchObject({
       toolCallId: "other-1",
       reason: "finish_called",
     });
@@ -218,7 +219,7 @@ describe("Agent Run Log", () => {
       usage: REPORTED_USAGE.usage,
     });
     expect(store.records.find((record) => record.type === "llm_disposition")).toMatchObject({
-      outcome: "discarded",
+      disposition: "discarded",
       reason: "user_interrupt",
       eventSeqs: [],
     });
@@ -246,7 +247,7 @@ describe("Agent Run Log", () => {
 
     expect(result.status).toBe("interrupted");
     expect(store.records.find((record) => record.type === "llm_failed")).toMatchObject({
-      outcome: "aborted",
+      reason: "aborted",
       errorCode: "llm_aborted",
     });
     expect(store.records.find((record) => record.type === "step_completed")).toMatchObject({
@@ -275,7 +276,7 @@ describe("Agent Run Log", () => {
     ).rejects.toThrow("provider down");
 
     expect(store.records.find((record) => record.type === "llm_failed")).toMatchObject({
-      outcome: "provider_error",
+      reason: "provider_error",
       errorCode: "llm_provider_error",
     });
     expect(store.records.some((record) => record.type === "llm_completed")).toBe(false);
@@ -313,7 +314,7 @@ describe("Agent Run Log", () => {
       usage: REPORTED_USAGE.usage,
     });
     expect(store.records.find((record) => record.type === "llm_disposition")).toMatchObject({
-      outcome: "rejected",
+      disposition: "rejected",
       reason: "max_tokens",
     });
     expect(conv.getEvents().map((event) => event.type)).toEqual([
@@ -361,7 +362,7 @@ describe("Agent Run Log", () => {
       "error",
     ]);
     expect(store.records.find((record) => record.type === "llm_disposition")).toMatchObject({
-      outcome: "rejected",
+      disposition: "rejected",
       reason: stopReason,
     });
   });
@@ -424,10 +425,11 @@ describe("Agent Run Log", () => {
     expect(result.status).toBe("completed");
     expect(conv.getEvents().map((event) => event.type)).toEqual([
       "user_message",
-      "thinking_finished",
+      "thinking_completed",
       "agent_message",
+      "tool_call_dispatched",
       "tool_result",
-      "finished",
+      "agent_completed",
     ]);
   });
 
@@ -481,7 +483,7 @@ describe("Agent Run Log", () => {
         .getEvents()
         .find(
           (event) =>
-            event.type === "user_message" &&
+            event.type === "context_message" &&
             event.text.includes("finish 调用的参数有误")
         )
     ).toBeDefined();
@@ -489,7 +491,7 @@ describe("Agent Run Log", () => {
       store.records
         .filter((record) => record.type === "step_completed")
         .map((record) => record.outcome)
-    ).toEqual(["continue", "finished"]);
+    ).toEqual(["continue", "completed"]);
   });
 
   it("无工具响应写入 finish 提示并继续下一 step", async () => {
@@ -504,11 +506,15 @@ describe("Agent Run Log", () => {
     let callCount = 0;
     const llm: LLMClient = {
       identity: { provider: "test", model: "model-1", apiMode: "messages" },
-      chat: vi.fn(async () => {
+      chat: vi.fn(async (messages: Message[]) => {
         callCount++;
         if (callCount === 1) {
           return response({ stopReason: "end_turn", text: "先汇报", toolCalls: [] });
         }
+        expect(messages.at(-1)).toMatchObject({
+          role: "user",
+          text: expect.stringContaining("请调用 finish 工具"),
+        });
         return response({
           toolCalls: [
             { id: "finish-2", name: "finish", args: { result: "done" } },
@@ -531,9 +537,18 @@ describe("Agent Run Log", () => {
         .getEvents()
         .find(
           (event) =>
-            event.type === "user_message" && event.text.includes("请调用 finish 工具")
+            event.type === "context_message" &&
+            event.text.includes("请调用 finish 工具")
         )
     ).toBeDefined();
+    expect(JSON.stringify(conv.getPublicEvents())).not.toContain(
+      "请调用 finish 工具"
+    );
+    expect(
+      projectCompactedContext(conv.getEvents()).messages.some(
+        (message) => message.text?.includes("请调用 finish 工具")
+      )
+    ).toBe(false);
   });
 
   it("工具批次中途 interrupt 时补齐剩余 tool_result", async () => {
@@ -592,7 +607,7 @@ describe("Agent Run Log", () => {
       { id: "call-1", isError: false },
       { id: "call-2", isError: true },
     ]);
-    expect(store.records.find((record) => record.type === "tool_skipped")).toMatchObject({
+    expect(store.records.find((record) => record.type === "tool_call_skipped")).toMatchObject({
       toolCallId: "call-2",
       reason: "user_interrupt",
     });
@@ -651,7 +666,7 @@ describe("Agent Run Log", () => {
       triggerId: "trigger-1",
     });
     const compactor = {
-      prepare: vi.fn(async (_conversation, events) => {
+      prepare: vi.fn(async (events) => {
         await conv.emit({
           type: "user_message",
           source: "user",
@@ -660,7 +675,6 @@ describe("Agent Run Log", () => {
         });
         return {
           ...projectCompactedContext(events),
-          projectedThroughSeq: events.at(-1)?.seq ?? 0,
           estimatedInputTokens: 0,
           compacted: false,
         };
@@ -681,7 +695,7 @@ describe("Agent Run Log", () => {
     const result = await new Agent(llm, new ToolRegistry().register(finish), {
       maxStep: 1,
       journal,
-      compactor,
+      lifecycle: createBuiltInAgentLifecycle({ compactor }),
     }).run(conv, runContext());
 
     expect(result).toMatchObject({ status: "completed", projectedThroughSeq: 1 });

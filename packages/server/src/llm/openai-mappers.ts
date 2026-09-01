@@ -294,7 +294,7 @@ export function fromOpenAIResponse(
   }
 
   return {
-    stopReason: refused ? "refusal" : toolCalls.length ? "tool_use" : "end_turn",
+    stopReason: refused ? "refusal" : toolCalls.length ? "tool_call" : "end_turn",
     text,
     toolCalls: refused ? [] : toolCalls,
     ...(!refused
@@ -383,7 +383,7 @@ export function fromOpenAIChatCompletion(
       args: parseToolArguments(call.function.arguments, "OpenAI Chat"),
     };
   });
-  return { stopReason: "tool_use", text, toolCalls, usage };
+  return { stopReason: "tool_call", text, toolCalls, usage };
 }
 
 function parseToolArguments(raw: string, provider: string): Record<string, unknown> {

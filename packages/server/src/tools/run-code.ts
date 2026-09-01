@@ -13,7 +13,7 @@ import type { ToolOutput } from "../llm/types.js";
  * LLM 按场景选择:数据分析/画图/需要 Python 库 → run_code;
  * 系统操作/文件处理/简单脚本 → run_bash。
  */
-const RunCodeArgs = z.object({
+export const RunCodeArgsSchema = z.object({
   code: z.string().describe("要执行的代码"),
   language: z
     .string()
@@ -21,18 +21,18 @@ const RunCodeArgs = z.object({
     .describe("编程语言,默认 python"),
 });
 
-type RunCodeArgsT = z.infer<typeof RunCodeArgs>;
+export type RunCodeArgs = z.infer<typeof RunCodeArgsSchema>;
 
-export const runCodeTool: Tool<RunCodeArgsT> = {
+export const runCodeTool: Tool<RunCodeArgs> = {
   name: "run_code",
   description:
     "在 Code Interpreter 中执行 Python 代码。支持数据分析、画图等。" +
     "返回 stdout、表达式返回值和图片(base64)。" +
     "适合需要 Python 库(pandas/matplotlib 等)的场景;" +
     "简单 shell 命令请用 run_bash。",
-  schema: RunCodeArgs,
+  schema: RunCodeArgsSchema,
 
-  async execute(args: RunCodeArgsT, ctx: ToolContext): Promise<ToolOutput> {
+  async execute(args: RunCodeArgs, ctx: ToolContext): Promise<ToolOutput> {
     const result = await ctx.runtime.runCode(args.code, {
       language: args.language,
     });

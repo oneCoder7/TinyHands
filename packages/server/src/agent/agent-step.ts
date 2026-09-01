@@ -1,19 +1,19 @@
 import type { Conversation } from "../conversation/conversation.js";
-import {
-  projectCompactedContext,
-  type Event,
-} from "../conversation/events.js";
+import type { Event } from "../conversation/events.js";
 import type { LLMClient } from "../llm/llm-client.js";
 import type { LLMResponse } from "../llm/types.js";
 import type { RunJournal } from "../observability/run-log.js";
 import type { Runtime } from "../runtime/runtime.js";
 import type { ToolContext, ToolRegistry } from "../tools/tool.js";
-import { AgentLlmCall } from "./agent-llm-call.js";
+import type { ToolPolicyGetter } from "../tools/tool-policy.js";
+import type { HumanInteractionCoordinator } from "../server/human-interaction.js";
+import { AgentLLMCall } from "./agent-llm-call.js";
+import { CompactionError } from "./context-compactor.js";
 import {
-  CompactionError,
-  type ContextCompactorLike,
-} from "./context-compactor.js";
-import { ToolExecutor } from "./tool-executor.js";
+  AgentLifecycle,
+  AgentLifecycleError,
+} from "./agent-lifecycle.js";
+import { ToolCallExecutor, type ToolTrace } from "./tool-call-executor.js";
 
 export interface AgentRunState {
   lastText: string;
@@ -23,6 +23,7 @@ export interface AgentRunState {
 export type AgentStepOutcome =
   | { type: "continue"; state: AgentRunState }
   | { type: "completed"; state: AgentRunState; result: string }
+  | { type: "suspended"; state: AgentRunState }
   | { type: "interrupted"; state: AgentRunState }
   | { type: "error"; state: AgentRunState; error: string };
 
@@ -35,17 +36,28 @@ export interface AgentStepInput {
   previousState: AgentRunState;
 }
 
+export interface ResumeAgentStepInput {
+  conversation: Conversation;
+  runtime: Runtime;
+  signal?: AbortSignal;
+  agentMessage: Extract<Event, { type: "agent_message" }>;
+}
+
 interface AgentStepExecutorOptions {
   journal: RunJournal;
-  compactor?: ContextCompactorLike;
+  lifecycle: AgentLifecycle;
+  maxModelAttemptsPerStep?: number;
+  interactions: HumanInteractionCoordinator;
+  toolPolicyGetter?: ToolPolicyGetter;
 }
 
 /** 一个 ReAct step 的事务编排：固定快照、调用 LLM、提交响应并调度工具。 */
 export class AgentStepExecutor {
   private readonly journal: RunJournal;
-  private readonly compactor?: ContextCompactorLike;
-  private readonly llmCall: AgentLlmCall;
-  private readonly toolExecutor: ToolExecutor;
+  private readonly lifecycle: AgentLifecycle;
+  private readonly maxModelAttemptsPerStep: number;
+  private readonly llmCall: AgentLLMCall;
+  private readonly toolExecutor: ToolCallExecutor;
 
   constructor(
     llm: LLMClient,
@@ -53,9 +65,21 @@ export class AgentStepExecutor {
     options: AgentStepExecutorOptions
   ) {
     this.journal = options.journal;
-    this.compactor = options.compactor;
-    this.llmCall = new AgentLlmCall(llm, options.journal);
-    this.toolExecutor = new ToolExecutor(tools, options.journal);
+    this.lifecycle = options.lifecycle;
+    this.maxModelAttemptsPerStep = options.maxModelAttemptsPerStep ?? 1;
+    if (
+      !Number.isInteger(this.maxModelAttemptsPerStep) ||
+      this.maxModelAttemptsPerStep < 1
+    ) {
+      throw new Error("maxModelAttemptsPerStep 必须是正整数");
+    }
+    this.llmCall = new AgentLLMCall(llm, options.journal);
+    this.toolExecutor = new ToolCallExecutor(
+      tools,
+      options.journal,
+      options.interactions,
+      options.toolPolicyGetter
+    );
   }
 
   async execute(input: AgentStepInput): Promise<AgentStepOutcome> {
@@ -85,7 +109,7 @@ export class AgentStepExecutor {
     });
     const stepStartedAt = Date.now();
     const completeStep = async (
-      outcome: "continue" | "finished" | "error" | "interrupted"
+      outcome: "continue" | "completed" | "error" | "interrupted"
     ) => {
       await this.journal.append({
         type: "step_completed",
@@ -100,55 +124,81 @@ export class AgentStepExecutor {
       projectedThroughSeq,
     });
 
-    let prepared = {
-      ...projectCompactedContext(events),
-      projectedThroughSeq,
-      estimatedInputTokens: 0,
-      compacted: false,
-    };
-    if (this.compactor) {
-      try {
-        prepared = await this.compactor.prepare(
-          conversation,
-          events,
-          this.tools.list(),
-          { runId, step, signal }
-        );
-      } catch (error) {
-        if (signal?.aborted) {
-          await completeStep("interrupted");
-          return { type: "interrupted", state: state(previousState.lastText) };
-        }
-        await completeStep("error");
-        if (error instanceof CompactionError) {
-          return {
-            type: "error",
-            state: state(previousState.lastText),
-            error: `上下文压缩失败：${error.code}`,
-          };
-        }
-        throw error;
+    let prepared;
+    try {
+      prepared = await this.lifecycle.prepareContext({
+        events,
+        tools: this.tools.list(),
+        runId,
+        step,
+        signal,
+      });
+    } catch (error) {
+      if (signal?.aborted) {
+        await completeStep("interrupted");
+        return { type: "interrupted", state: state(previousState.lastText) };
       }
+      if (error instanceof CompactionError) {
+        await completeStep("error");
+        return {
+          type: "error",
+          state: state(previousState.lastText),
+          error: `上下文压缩失败：${error.code}`,
+        };
+      }
+      return this.failLifecycle(
+        conversation,
+        completeStep,
+        state(previousState.lastText),
+        error
+      );
     }
-    projectedThroughSeq = prepared.projectedThroughSeq;
     if (signal?.aborted) {
       await completeStep("interrupted");
       return { type: "interrupted", state: state(previousState.lastText) };
     }
 
-    const llmOutcome = await this.llmCall.execute({
-      runId,
-      step,
-      projectedThroughSeq,
-      messages: prepared.messages,
-      systemContext: prepared.systemContext,
-      tools: this.tools.list(),
-      signal,
-      onDelta: (delta) => conversation.emitDelta(delta),
-    });
-    if (llmOutcome.type === "provider_error") {
-      await completeStep("error");
-      throw llmOutcome.error;
+    let attempt = 1;
+    let llmOutcome;
+    while (true) {
+      llmOutcome = await this.llmCall.execute({
+        runId,
+        step,
+        projectedThroughSeq,
+        messages: prepared.messages,
+        systemContext: prepared.systemContext,
+        tools: this.tools.list(),
+        signal,
+        onDelta: (delta) => conversation.emitDelta(delta),
+      });
+      if (llmOutcome.type !== "provider_error") break;
+      if (signal?.aborted) {
+        await completeStep("interrupted");
+        return { type: "interrupted", state: state(previousState.lastText) };
+      }
+      if (attempt >= this.maxModelAttemptsPerStep) {
+        await completeStep("error");
+        throw llmOutcome.error;
+      }
+      let decision;
+      try {
+        decision = await this.lifecycle.resolveRequestError({
+          error: llmOutcome.error,
+          attempt,
+        });
+      } catch (error) {
+        return this.failLifecycle(
+          conversation,
+          completeStep,
+          state(previousState.lastText),
+          error
+        );
+      }
+      if (decision === "fail") {
+        await completeStep("error");
+        throw llmOutcome.error;
+      }
+      attempt++;
     }
     if (llmOutcome.type === "aborted") {
       await completeStep("interrupted");
@@ -163,7 +213,7 @@ export class AgentStepExecutor {
         runId,
         step,
         llmCallId,
-        outcome: "discarded",
+        disposition: "discarded",
         reason: "user_interrupt",
         eventSeqs: [],
       });
@@ -173,7 +223,39 @@ export class AgentStepExecutor {
 
     const lastText = response.text;
     const responseEventSeqs: number[] = [];
-    const rejection = rejectedResponse(response.stopReason);
+    let rejection;
+    try {
+      rejection = await this.lifecycle.inspectResponse(response.stopReason);
+    } catch (error) {
+      await this.journal.append({
+        type: "llm_disposition",
+        runId,
+        step,
+        llmCallId,
+        disposition: "discarded",
+        reason: "lifecycle_error",
+        eventSeqs: [],
+      });
+      return this.failLifecycle(
+        conversation,
+        completeStep,
+        state(lastText),
+        error
+      );
+    }
+    if (signal?.aborted) {
+      await this.journal.append({
+        type: "llm_disposition",
+        runId,
+        step,
+        llmCallId,
+        disposition: "discarded",
+        reason: "user_interrupt",
+        eventSeqs: [],
+      });
+      await completeStep("interrupted");
+      return { type: "interrupted", state: state(previousState.lastText) };
+    }
     if (rejection) {
       const errorEvent = await conversation.emit({
         type: "error",
@@ -186,7 +268,7 @@ export class AgentStepExecutor {
         runId,
         step,
         llmCallId,
-        outcome: "rejected",
+        disposition: "rejected",
         reason: rejection.reason,
         eventSeqs: responseEventSeqs,
       });
@@ -201,34 +283,15 @@ export class AgentStepExecutor {
     // thinking 必须先于同轮 agent_message，保证投影时折叠进同一 assistant 消息。
     if (response.thinkingBlocks?.length) {
       const thinkingEvent = await conversation.emit({
-        type: "thinking_finished",
+        type: "thinking_completed",
         source: "agent",
         blocks: response.thinkingBlocks,
       });
       responseEventSeqs.push(thinkingEvent.seq);
     }
 
-    if (response.toolCalls.length === 0) {
-      const agentEvent = await this.commitAgentMessage(conversation, response);
-      responseEventSeqs.push(agentEvent.seq);
-      await this.recordCommittedDisposition(
-        runId,
-        step,
-        llmCallId,
-        responseEventSeqs
-      );
-      await conversation.emit({
-        type: "user_message",
-        source: "user",
-        text:
-          "如果任务已经完成，请调用 finish 工具给出最终答复；" +
-          "如果还需要继续操作，请发起相应的工具调用。",
-      });
-      await completeStep("continue");
-      return { type: "continue", state: state(lastText) };
-    }
-
-    const agentEvent = await this.commitAgentMessage(conversation, response);
+    const trace: ToolTrace = { runId, step, llmCallId, projectedThroughSeq };
+    const agentEvent = await this.commitAgentMessage(conversation, response, trace);
     responseEventSeqs.push(agentEvent.seq);
     await this.recordCommittedDisposition(
       runId,
@@ -237,19 +300,78 @@ export class AgentStepExecutor {
       responseEventSeqs
     );
 
-    const trace = { runId, step, llmCallId };
-    const context: ToolContext = { runtime };
-    const finishCall = response.toolCalls.find((call) => call.name === "finish");
-    if (finishCall) {
-      const result = await this.toolExecutor.execute(
+    let plan;
+    try {
+      plan = await this.lifecycle.planCommittedResponse(response.toolCalls);
+    } catch (error) {
+      await this.skipPendingCallsForLifecycleError(
         conversation,
-        finishCall,
+        response.toolCalls,
+        { runId, step, llmCallId }
+      );
+      return this.failLifecycle(
+        conversation,
+        completeStep,
+        state(lastText),
+        error
+      );
+    }
+
+    if (!plan && response.toolCalls.length === 0) {
+      return this.failLifecycle(
+        conversation,
+        completeStep,
+        state(lastText),
+        new AgentLifecycleError(
+          "committed_response",
+          "unhandled-empty-response"
+        )
+      );
+    }
+
+    if (plan?.type === "continue") {
+      await conversation.emit({
+        type: "context_message",
+        source: "environment",
+        text: plan.contextMessage,
+      });
+      await completeStep("continue");
+      return { type: "continue", state: state(lastText) };
+    }
+
+    const context: ToolContext = { runtime };
+    if (plan?.type === "execute_completion_tool") {
+      const completionCall = response.toolCalls.find(
+        (call) => call.id === plan.toolCallId
+      );
+      if (!completionCall) {
+        await this.skipPendingCallsForLifecycleError(
+          conversation,
+          response.toolCalls,
+          trace
+        );
+        return this.failLifecycle(
+          conversation,
+          completeStep,
+          state(lastText),
+          new AgentLifecycleError(
+            "committed_response",
+            "missing-completion-tool"
+          )
+        );
+      }
+      const result = await this.toolExecutor.executeCall(
+        conversation,
+        completionCall,
         context,
         trace
       );
+      if ("type" in result) {
+        return { type: "suspended", state: state(lastText) };
+      }
       for (const call of response.toolCalls) {
-        if (call.id === finishCall.id) continue;
-        await this.toolExecutor.skip(
+        if (call.id === completionCall.id) continue;
+        await this.toolExecutor.skipCall(
           conversation,
           call,
           trace,
@@ -260,20 +382,20 @@ export class AgentStepExecutor {
 
       if (result.isError) {
         await conversation.emit({
-          type: "user_message",
-          source: "user",
-          text: "finish 调用的参数有误，请检查后重新调用 finish 工具。",
+          type: "context_message",
+          source: "environment",
+          text: plan.onErrorContextMessage,
         });
         await completeStep("continue");
         return { type: "continue", state: state(lastText) };
       }
 
       await conversation.emit({
-        type: "finished",
+        type: "agent_completed",
         source: "agent",
         result: result.content,
       });
-      await completeStep("finished");
+      await completeStep("completed");
       return {
         type: "completed",
         state: state(lastText),
@@ -281,7 +403,7 @@ export class AgentStepExecutor {
       };
     }
 
-    const batchOutcome = await this.toolExecutor.executeBatch(
+    const batchOutcome = await this.toolExecutor.executeCalls(
       conversation,
       response.toolCalls,
       context,
@@ -292,14 +414,136 @@ export class AgentStepExecutor {
       await completeStep("interrupted");
       return { type: "interrupted", state: state(lastText) };
     }
+    if (batchOutcome.type === "suspended") {
+      return { type: "suspended", state: state(lastText) };
+    }
 
     await completeStep("continue");
     return { type: "continue", state: state(lastText) };
   }
 
+  /**
+   * 从已提交的 agent_message 恢复同一个 step。恢复坐标只来自 Conversation Event；
+   * Run Log 只接收补写记录，绝不参与恢复判断。
+   */
+  async resumeCommittedResponse(
+    input: ResumeAgentStepInput
+  ): Promise<AgentStepOutcome> {
+    const { conversation, runtime, signal, agentMessage } = input;
+    const trace = agentMessage.executionTrace;
+    if (!trace) {
+      return {
+        type: "error",
+        state: { lastText: agentMessage.text, projectedThroughSeq: 0 },
+        error: "缺少工具调用恢复坐标",
+      };
+    }
+    const state: AgentRunState = {
+      lastText: agentMessage.text,
+      projectedThroughSeq: trace.projectedThroughSeq,
+    };
+    const completeStep = async (
+      outcome: "continue" | "completed" | "error" | "interrupted"
+    ) => {
+      await this.journal.append({
+        type: "step_completed",
+        runId: trace.runId,
+        step: trace.step,
+        outcome,
+        durationMs: 0,
+      });
+    };
+
+    let plan;
+    try {
+      plan = await this.lifecycle.planCommittedResponse(agentMessage.toolCalls);
+    } catch (error) {
+      await this.skipPendingCallsForLifecycleError(
+        conversation,
+        agentMessage.toolCalls,
+        trace
+      );
+      return this.failLifecycle(conversation, completeStep, state, error);
+    }
+
+    if (plan?.type === "continue") {
+      await conversation.emit({
+        type: "context_message",
+        source: "environment",
+        text: plan.contextMessage,
+      });
+      await completeStep("continue");
+      return { type: "continue", state };
+    }
+
+    const context: ToolContext = { runtime };
+    if (plan?.type === "execute_completion_tool") {
+      const completionCall = agentMessage.toolCalls.find(
+        (call) => call.id === plan.toolCallId
+      );
+      if (!completionCall) {
+        return this.failLifecycle(
+          conversation,
+          completeStep,
+          state,
+          new AgentLifecycleError("committed_response", "missing-completion-tool")
+        );
+      }
+      const result = await this.toolExecutor.executeCall(
+        conversation,
+        completionCall,
+        context,
+        trace
+      );
+      if ("type" in result) return { type: "suspended", state };
+      for (const call of agentMessage.toolCalls) {
+        if (call.id === completionCall.id) continue;
+        await this.toolExecutor.skipCall(
+          conversation,
+          call,
+          trace,
+          "finish_called",
+          "finish 已在本轮调用，该工具未执行"
+        );
+      }
+      if (result.isError) {
+        await conversation.emit({
+          type: "context_message",
+          source: "environment",
+          text: plan.onErrorContextMessage,
+        });
+        await completeStep("continue");
+        return { type: "continue", state };
+      }
+      await conversation.emit({
+        type: "agent_completed",
+        source: "agent",
+        result: result.content,
+      });
+      await completeStep("completed");
+      return { type: "completed", state, result: result.content };
+    }
+
+    const batch = await this.toolExecutor.executeCalls(
+      conversation,
+      agentMessage.toolCalls,
+      context,
+      trace,
+      signal
+    );
+    if (batch.type === "suspended") return { type: "suspended", state };
+    if (batch.type === "interrupted") {
+      await completeStep("interrupted");
+      return { type: "interrupted", state };
+    }
+    await completeStep("continue");
+    return { type: "continue", state };
+  }
+
   private commitAgentMessage(
     conversation: Conversation,
-    response: LLMResponse
+    response: LLMResponse,
+    executionTrace: ToolTrace
   ) {
     return conversation.emit({
       type: "agent_message",
@@ -307,6 +551,7 @@ export class AgentStepExecutor {
       text: response.text,
       toolCalls: response.toolCalls,
       providerReplay: response.providerReplay,
+      executionTrace,
     });
   }
 
@@ -321,28 +566,44 @@ export class AgentStepExecutor {
       runId,
       step,
       llmCallId,
-      outcome: "committed",
+      disposition: "committed",
       eventSeqs,
     });
   }
-}
 
-function rejectedResponse(
-  stopReason: LLMResponse["stopReason"]
-):
-  | {
-      reason: "max_tokens" | "content_filter" | "refusal";
-      message: string;
+  private async failLifecycle(
+    conversation: Conversation,
+    completeStep: (
+      outcome: "continue" | "completed" | "error" | "interrupted"
+    ) => Promise<void>,
+    state: AgentRunState,
+    error: unknown
+  ): Promise<AgentStepOutcome> {
+    const phase =
+      error instanceof AgentLifecycleError ? error.phase : "prepare_context";
+    const message = `Agent 生命周期扩展失败：${phase}`;
+    await conversation.emit({
+      type: "error",
+      source: "agent",
+      message,
+    });
+    await completeStep("error");
+    return { type: "error", state, error: message };
+  }
+
+  private async skipPendingCallsForLifecycleError(
+    conversation: Conversation,
+    calls: LLMResponse["toolCalls"],
+    trace: { runId: string; step: number; llmCallId: string }
+  ): Promise<void> {
+    for (const call of calls) {
+      await this.toolExecutor.skipCall(
+        conversation,
+        call,
+        trace,
+        "lifecycle_error",
+        "Agent 生命周期扩展失败，该工具未执行"
+      );
     }
-  | undefined {
-  switch (stopReason) {
-    case "max_tokens":
-      return { reason: stopReason, message: "LLM 输出被截断，本轮结果不可信" };
-    case "content_filter":
-      return { reason: stopReason, message: "LLM 输出被内容过滤，本轮未执行" };
-    case "refusal":
-      return { reason: stopReason, message: "LLM 拒绝了本轮请求，本轮未执行" };
-    default:
-      return undefined;
   }
 }

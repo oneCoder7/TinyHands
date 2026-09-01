@@ -28,10 +28,10 @@ export class LocalRuntime implements Runtime {
   }
 
   /** no-op:本地执行无资源需创建 */
-  async create(): Promise<void> {}
+  async start(): Promise<void> {}
 
   /** no-op:本地执行无资源需释放 */
-  async kill(): Promise<void> {}
+  async close(): Promise<void> {}
 
   async exec(
     command: string,

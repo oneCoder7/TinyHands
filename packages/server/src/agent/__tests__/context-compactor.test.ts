@@ -57,12 +57,13 @@ async function harness(
     identity: { provider: "test", model: "model", apiMode: "messages" },
     chat,
   };
+  const conversation = new Conversation("c1");
   return {
     store,
     journal,
     llm,
-    compactor: new ContextCompactor(llm, journal, CONFIG, 1000),
-    conversation: new Conversation("c1"),
+    compactor: new ContextCompactor(llm, journal, CONFIG, 1000, conversation),
+    conversation,
   };
 }
 
@@ -76,7 +77,6 @@ describe("ContextCompactor", () => {
     });
 
     const prepared = await h.compactor.prepare(
-      h.conversation,
       h.conversation.getEvents(),
       [],
       { runId: "run-1", step: 0 }
@@ -109,7 +109,6 @@ describe("ContextCompactor", () => {
     });
 
     const prepared = await h.compactor.prepare(
-      h.conversation,
       h.conversation.getEvents(),
       [],
       { runId: "run-1", step: 0 }
@@ -124,16 +123,14 @@ describe("ContextCompactor", () => {
       "agent_message",
       "user_message",
       "compaction_started",
-      "compacted",
       "compaction_completed",
     ]);
     const checkpoint = events.find(
-      (event): event is Extract<Event, { type: "compacted" }> =>
-        event.type === "compacted"
+      (event) => event.type === "compaction_completed" && "summary" in event
     );
     expect(checkpoint?.throughSeq).toBeLessThan(latest.seq);
-    expect(h.conversation.getPublicEvents().map((event) => event.type)).not.toContain(
-      "compacted"
+    expect(h.conversation.getPublicEvents().map((event) => event.type)).toContain(
+      "compaction_completed"
     );
     expect(h.llm.chat).toHaveBeenCalledWith(
       expect.any(Array),
@@ -151,6 +148,48 @@ describe("ContextCompactor", () => {
     });
   });
 
+  it("context_message 参与请求预算但不进入摘要，并在压缩后继续附加", async () => {
+    const chat = vi.fn(async (messages: import("../../llm/types.js").Message[]) => {
+      expect(JSON.stringify(messages)).not.toContain("one-shot-reminder");
+      return response();
+    });
+    const h = await harness(chat);
+    await h.conversation.emit({
+      type: "user_message",
+      source: "user",
+      text: "old artifact /workspace/a.ts:" + "x".repeat(15_000),
+    });
+    await h.conversation.emit({
+      type: "agent_message",
+      source: "agent",
+      text: "old answer",
+      toolCalls: [],
+    });
+    await h.conversation.emit({
+      type: "context_message",
+      source: "environment",
+      text: "one-shot-reminder",
+    });
+    await h.conversation.emit({
+      type: "user_message",
+      source: "user",
+      text: "latest query",
+    });
+
+    const prepared = await h.compactor.prepare(
+      h.conversation.getEvents(),
+      [],
+      { runId: "run-context", step: 0 }
+    );
+
+    expect(prepared.compacted).toBe(true);
+    expect(prepared.messages.at(-1)).toEqual({
+      role: "user",
+      text: "one-shot-reminder",
+    });
+    expect(prepared.systemContext[0]).not.toContain("one-shot-reminder");
+  });
+
   it("摘要连续无效时只修复一次，最终公开 summary_invalid", async () => {
     const chat = vi.fn(async () => response("not-json"));
     const h = await harness(chat);
@@ -166,7 +205,7 @@ describe("ContextCompactor", () => {
     });
 
     await expect(
-      h.compactor.prepare(h.conversation, h.conversation.getEvents(), [], {
+      h.compactor.prepare(h.conversation.getEvents(), [], {
         runId: "run-1",
         step: 0,
       })
@@ -177,7 +216,7 @@ describe("ContextCompactor", () => {
       type: "compaction_failed",
       code: "summary_invalid",
     });
-    expect(h.conversation.getEvents().some((event) => event.type === "compacted"))
+    expect(h.conversation.getEvents().some((event) => event.type === "compaction_completed" && "summary" in event))
       .toBe(false);
   });
 
@@ -205,7 +244,6 @@ describe("ContextCompactor", () => {
     });
     const controller = new AbortController();
     const preparing = h.compactor.prepare(
-      h.conversation,
       h.conversation.getEvents(),
       [],
       { runId: "run-1", step: 0, signal: controller.signal }
@@ -218,10 +256,10 @@ describe("ContextCompactor", () => {
       type: "compaction_cancelled",
       reason: "user_interrupt",
     });
-    expect(h.conversation.getEvents().some((event) => event.type === "compacted"))
+    expect(h.conversation.getEvents().some((event) => event.type === "compaction_completed" && "summary" in event))
       .toBe(false);
     expect(h.store.records.find((record) => record.type === "llm_failed"))
-      .toMatchObject({ outcome: "aborted", purpose: "compaction" });
+      .toMatchObject({ reason: "aborted", purpose: "compaction" });
   });
 
   it("最新单段独自超过窗口时明确失败，不调用摘要模型", async () => {
@@ -233,7 +271,7 @@ describe("ContextCompactor", () => {
     });
 
     await expect(
-      h.compactor.prepare(h.conversation, h.conversation.getEvents(), [], {
+      h.compactor.prepare(h.conversation.getEvents(), [], {
         runId: "run-1",
         step: 0,
       })
@@ -250,7 +288,7 @@ describe("findSafeCompactionBoundaries", () => {
   it("不会在 thinking/工具调用未闭合处切割", () => {
     const events: Event[] = [
       { id: "e1", seq: 1, timestamp: 1, source: "user", type: "user_message", text: "old" },
-      { id: "e2", seq: 2, timestamp: 2, source: "agent", type: "thinking_finished", blocks: [] },
+      { id: "e2", seq: 2, timestamp: 2, source: "agent", type: "thinking_completed", blocks: [] },
       { id: "e3", seq: 3, timestamp: 3, source: "agent", type: "agent_message", text: "", toolCalls: [{ id: "t1", name: "tool", args: {} }] },
       { id: "e4", seq: 4, timestamp: 4, source: "environment", type: "tool_result", toolCallId: "t1", content: "ok", isError: false },
       { id: "e5", seq: 5, timestamp: 5, source: "user", type: "user_message", text: "latest" },

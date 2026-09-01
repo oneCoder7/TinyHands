@@ -72,12 +72,14 @@ export async function createTinyhandsHost(
       config: config.llm.autoCompact,
       maxOutputTokens: config.llm.maxTokens,
     },
+    toolPolicyGetter: config.toolPolicy?.getter,
   });
 
   const conversations = new DefaultConversationService({
       workspaceRoot: config.workspaceRoot,
       createSession,
       conversationStore,
+      defaultToolPolicyMode: config.toolPolicy?.defaultMode ?? "default",
       logger,
     });
   return new DefaultTinyhandsHost(

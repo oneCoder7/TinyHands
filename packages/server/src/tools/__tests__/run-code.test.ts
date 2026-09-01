@@ -11,8 +11,8 @@ function mockRuntime(
     runtime: {
       runCode: async () => result,
       // 其余方法不会被 run_code 工具调用,填 stub
-      create: async () => {},
-      kill: async () => {},
+      start: async () => {},
+      close: async () => {},
       exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
       readFile: async () => "",
       writeFile: async () => {},
@@ -89,8 +89,8 @@ describe("run_code 工具", () => {
           captured = opts;
           return { stdout: "", stderr: "", images: [] };
         },
-        create: async () => {},
-        kill: async () => {},
+        start: async () => {},
+        close: async () => {},
         exec: async () => ({ stdout: "", stderr: "", exitCode: 0 }),
         readFile: async () => "",
         writeFile: async () => {},

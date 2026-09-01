@@ -33,8 +33,8 @@ async function buildApp(factoryOverride?: SessionFactory) {
         getEventsSince: () => [],
       } as any,
       agent: {} as any,
-      journal: {} as any,
-      runtime: { create: async () => {}, kill: async () => {} } as any,
+      journal: { recoverOpenRuns: async () => {} } as any,
+      runtime: { start: async () => {}, close: async () => {} } as any,
       conversationCreatedAt: Date.now(),
     }));
 
@@ -144,8 +144,8 @@ describe("POST /conversations/create — tools 字段", () => {
           getEventsSince: () => [],
         } as any,
         agent: {} as any,
-        journal: {} as any,
-        runtime: { create: async () => {}, kill: async () => {} } as any,
+        journal: { recoverOpenRuns: async () => {} } as any,
+        runtime: { start: async () => {}, close: async () => {} } as any,
         conversationCreatedAt: Date.now(),
       });
     };
@@ -178,7 +178,7 @@ describe("POST /conversations/send — triggerId", () => {
       // 保持 driver pending：该测试只验证 HTTP receipt，不执行 Agent 行为。
       agent: { run: async () => await new Promise(() => {}) } as any,
       journal: { append: async () => {}, getRecords: () => [] } as any,
-      runtime: { create: async () => {}, kill: async () => {} } as any,
+      runtime: { start: async () => {}, close: async () => {} } as any,
       conversationCreatedAt: Date.now(),
     });
     const { app } = await buildApp(factory);

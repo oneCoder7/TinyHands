@@ -4,18 +4,24 @@ import type { LLMClient } from "../llm/llm-client.js";
 import type { RunJournal } from "../observability/run-log.js";
 import type { Runtime } from "../runtime/runtime.js";
 import type { ToolRegistry } from "../tools/tool.js";
+import type { ToolPolicyGetter } from "../tools/tool-policy.js";
+import { HumanInteractionCoordinator } from "../server/human-interaction.js";
 import {
   AgentStepExecutor,
   type AgentRunState,
   type AgentStepOutcome,
 } from "./agent-step.js";
-import type { ContextCompactorLike } from "./context-compactor.js";
+import {
+  AgentLifecycle,
+  createBuiltInAgentLifecycle,
+} from "./agent-lifecycle.js";
 
 export type RunStatus =
   | "completed"
   | "max_steps_exceeded"
   | "error"
-  | "interrupted";
+  | "interrupted"
+  | "suspended";
 
 export interface RunResult {
   status: RunStatus;
@@ -34,7 +40,10 @@ export interface RunResult {
 export interface AgentOptions {
   maxStep?: number;
   journal: RunJournal;
-  compactor?: ContextCompactorLike;
+  /** server-internal；每个 AgentSession 必须持有独立实例。 */
+  lifecycle?: AgentLifecycle;
+  maxModelAttemptsPerStep?: number;
+  toolPolicyGetter?: ToolPolicyGetter;
 }
 
 /** 单次 Agent run 所需的进程内能力；不进入 Conversation 持久状态。 */
@@ -42,6 +51,10 @@ export interface AgentRunContext {
   runId: string;
   runtime: Runtime;
   signal?: AbortSignal;
+}
+
+export interface AgentResumeContext extends AgentRunContext {
+  agentMessage: Extract<Event, { type: "agent_message" }>;
 }
 
 /** Agent 是 ReAct run 的公共 facade；单步事务由 AgentStepExecutor 完成。 */
@@ -53,7 +66,10 @@ export class Agent {
     this.maxStep = options.maxStep ?? 10;
     this.stepExecutor = new AgentStepExecutor(llm, tools, {
       journal: options.journal,
-      compactor: options.compactor,
+      lifecycle: options.lifecycle ?? createBuiltInAgentLifecycle(),
+      maxModelAttemptsPerStep: options.maxModelAttemptsPerStep,
+      interactions: new HumanInteractionCoordinator(),
+      toolPolicyGetter: options.toolPolicyGetter,
     });
   }
 
@@ -61,12 +77,50 @@ export class Agent {
     conversation: Conversation,
     context: AgentRunContext
   ): Promise<RunResult> {
-    let state: AgentRunState = {
+    return this.runSteps(conversation, context, 0, {
       lastText: "",
       projectedThroughSeq: 0,
-    };
+    });
+  }
 
-    for (let step = 0; step < this.maxStep; step++) {
+  async resume(
+    conversation: Conversation,
+    context: AgentResumeContext
+  ): Promise<RunResult> {
+    const trace = context.agentMessage.executionTrace;
+    if (!trace || trace.runId !== context.runId) {
+      return {
+        status: "error",
+        lastText: context.agentMessage.text,
+        trajectory: conversation.getEvents(),
+        error: "工具调用恢复坐标不合法",
+        projectedThroughSeq: trace?.projectedThroughSeq ?? 0,
+      };
+    }
+    const outcome = await this.stepExecutor.resumeCommittedResponse({
+      conversation,
+      runtime: context.runtime,
+      signal: context.signal,
+      agentMessage: context.agentMessage,
+    });
+    if (outcome.type !== "continue") return toRunResult(conversation, outcome);
+    return this.runSteps(
+      conversation,
+      context,
+      trace.step + 1,
+      outcome.state
+    );
+  }
+
+  private async runSteps(
+    conversation: Conversation,
+    context: AgentRunContext,
+    startStep: number,
+    initialState: AgentRunState
+  ): Promise<RunResult> {
+    let state = initialState;
+
+    for (let step = startStep; step < this.maxStep; step++) {
       // 上一步配对已闭合；步首打断无需创建虚假的 step 生命周期。
       if (context.signal?.aborted) {
         return interruptedResult(conversation, state);
@@ -132,6 +186,8 @@ function toRunResult(
       return { status: "completed", result: outcome.result, ...base };
     case "interrupted":
       return { status: "interrupted", ...base };
+    case "suspended":
+      return { status: "suspended", ...base };
     case "error":
       return { status: "error", error: outcome.error, ...base };
   }

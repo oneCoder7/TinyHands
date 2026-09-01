@@ -58,13 +58,13 @@ function makeRealFactory(conversationStore: FsConversationStore) {
     createCalls.set(conversationId, 0);
     killCalls.set(conversationId, 0);
     const runtime = {
-      create: async () => {
+      start: async () => {
         createCalls.set(
           conversationId,
           (createCalls.get(conversationId) ?? 0) + 1
         );
       },
-      kill: async () => {
+      close: async () => {
         killCalls.set(
           conversationId,
           (killCalls.get(conversationId) ?? 0) + 1
@@ -79,7 +79,7 @@ function makeRealFactory(conversationStore: FsConversationStore) {
       conversationId,
       conversation,
       agent: {} as never,
-      journal: {} as never,
+      journal: { recoverOpenRuns: async () => {} } as never,
       runtime,
       conversationCreatedAt: initialRecord?.createdAt ?? Date.now(),
     });
@@ -186,7 +186,7 @@ describe("ConversationService 持久化与恢复", () => {
       text: "数文件",
     });
     await s1.conversation.emit({
-      type: "thinking_finished",
+      type: "thinking_completed",
       source: "agent",
       blocks: [{ thinking: "想一下", signature: "sig-1" }],
     });
@@ -204,13 +204,13 @@ describe("ConversationService 持久化与恢复", () => {
       isError: false,
     });
     await s1.conversation.emit({
-      type: "finished",
+      type: "agent_completed",
       source: "agent",
       result: "done",
     });
 
     const before = fingerprint(s1.conversation.getEvents());
-    expect(before.length).toBe(5);
+    expect(before.length).toBe(6);
 
     // 模拟崩溃:丢 m1(内存全没),新进程同 workspaceRoot 起 m2
     const m2 = newManager(root);
@@ -226,7 +226,7 @@ describe("ConversationService 持久化与恢复", () => {
       source: "user",
       text: "再来",
     });
-    expect(e6.seq).toBe(6);
+    expect(e6.seq).toBe(7);
   });
 
   it("恢复全程零 runtime.create(§6 验收7 恢复侧)", async () => {
@@ -245,7 +245,7 @@ describe("ConversationService 持久化与恢复", () => {
     expect(m2.getFactoryCalls()).toBe(1); // 装配一次(用来续聊)
   });
 
-  it("list 大量空闲会话零 runtime.create、不装配(§6 验收7)", async () => {
+  it("list 大量空闲会话零 runtime.start、不装配(§6 验收7)", async () => {
     const root = tmpRoot();
     const m1 = newManager(root);
     for (const id of ["a", "b", "c"]) {
